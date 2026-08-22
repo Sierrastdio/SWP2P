@@ -1,7 +1,0 @@
-데이터 선 1~8개: (가변: 소스코드 작성 단계에서 사용자가 데이터선 개수 정함) (Wired-AND / Open-Drain, Pull-up)
-
-CLK: 전송 동기화 클럭. 통신에 연결된 아두이노중 하나가 CLK을 생성해야함. 그러나 실질적 마스터 역할을 하지 않음.(Single-Drive (Master Output))
-
-BUSY: 버스 점유 상태 표시 및 패킷 시작/끝 (Wired-AND / Open-Drain, Pull-up)
-
-ACK: 수신 노드가 패킷을 정상 수신했는지 즉시 응답하는 용도.(Wired-AND / Open-Drain, Pull-up)
