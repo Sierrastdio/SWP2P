@@ -17,6 +17,14 @@ public:
     void _onClkEdge();
     void _onBusyEdge();
     void _onAckEdge();
+
+    // 핀별 포트 레지스터 캐시 (begin()에서 1회 계산, ISR에서는 포인터 역참조만 - digitalWrite류 금지)
+    struct PinFast {
+        volatile uint8_t* ddr;
+        volatile uint8_t* port;
+        volatile uint8_t* pin;
+        uint8_t mask;
+    };
 private:
     uint8_t _nodeId;
     bool _clkIsOutput;
@@ -31,9 +39,6 @@ private:
     volatile uint8_t _rxTail;
     volatile uint8_t _rxCount;
     // Tx 상태: 대기(pending) -> 중재 -> 데이터 -> release -> done
-    // TX_PENDING: send()가 호출된 직후, 아직 실제 BUSY_N을 구동하지 않은 상태.
-    //             다음 CLK posedge에서 _onClkEdge()가 BUSY_N 하강과 첫 주소 청크
-    //             구동을 "동시에" 실행하도록 하기 위한 동기화용 중간 상태.
     enum TxState : uint8_t { TX_IDLE, TX_PENDING, TX_ARB, TX_DATA, TX_RELEASE, TX_DONE, TX_LOST };
     volatile TxState _txState;
     uint8_t _txDestId;
@@ -52,26 +57,34 @@ private:
     volatile bool _rxCapturedThisFrame;
     void setupTimer1(unsigned long freq);
     void stopTimer1();
-    // 핀별 포트 레지스터 캐시 (begin()에서 1회 계산, ISR에서는 포인터 역참조만 - digitalWrite류 금지)
-    struct PinFast {
-        volatile uint8_t* ddr;
-        volatile uint8_t* port;
-        volatile uint8_t* pin;
-        uint8_t mask;
-    };
+
     PinFast _dataPinFast[8];
     void _cachePinFast(uint8_t pinNum, PinFast& out);
-    // 데이터선 open-drain 헬퍼 (임의 핀 배열 -> 범용 API 사용, DATA_BUS는 런타임 핀이라 포인터 방식 불가피)
-    void _driveDataChunk(uint8_t chunkVal);   // WIDTH비트 동시 구동/release
-    uint8_t _readDataChunk();
+
+    // ---- WIDTH별 언롤 구현 (1/2/4/8) ----
+    // 전부 static 함수: 멤버함수 포인터의 this-adjustment 오버헤드를 피하기 위해
+    // PinFast 배열을 인자로 직접 받는다. ISR 핫패스이므로 함수 호출 자체도
+    // begin()에서 한 번 고른 뒤 포인터로 고정, 매 엣지마다 분기(switch)하지 않는다.
+    static void _drive_W1(PinFast* p, uint8_t chunkVal);
+    static void _drive_W2(PinFast* p, uint8_t chunkVal);
+    static void _drive_W4(PinFast* p, uint8_t chunkVal);
+    static void _drive_W8(PinFast* p, uint8_t chunkVal);
+    static uint8_t _read_W1(PinFast* p);
+    static uint8_t _read_W2(PinFast* p);
+    static uint8_t _read_W4(PinFast* p);
+    static uint8_t _read_W8(PinFast* p);
+
+    typedef void (*DriveFn)(PinFast*, uint8_t);
+    typedef uint8_t (*ReadFn)(PinFast*);
+    DriveFn _driveFn; // begin()에서 WIDTH에 맞게 1회 바인딩
+    ReadFn  _readFn;
+
+    // 얇은 래퍼 - 기존 호출부(_onClkEdge 등)는 이 두 줄만 통해서 부른다
+    inline void _driveDataChunk(uint8_t chunkVal) { _driveFn(_dataPinFast, chunkVal); }
+    inline uint8_t _readDataChunk() { return _readFn(_dataPinFast); }
     void _dataRelease();
 
     // ---- BUSY_N(D3=PORTD bit3) / ACK_N(D8=PORTB bit0) ----
-    // 이 두 핀은 #define으로 고정된 컴파일타임 상수이므로, DATA_BUS처럼 런타임 포인터
-    // 캐시(PinFast)를 거치지 않고 레지스터를 직접 컴파일타임 상수로 조작한다.
-    // 이러면 (1) 함수 호출/리턴 오버헤드가 인라인으로 사라지고, (2) 컴파일러가 런타임
-    // 포인터 역참조 대신 컴파일타임 비트 위치를 알고 있으므로 훨씬 짧은 코드를 낼 수 있다.
-    // (DATA_BUS는 begin()에서 사용자가 임의로 핀을 고를 수 있어 이 최적화를 적용할 수 없다.)
     static inline void _busyDriveLow() { PORTD &= ~(1 << 3); DDRD |= (1 << 3); }
     static inline void _busyRelease()  { DDRD &= ~(1 << 3); PORTD &= ~(1 << 3); }
     static inline bool _busyRead()     { return (PIND & (1 << 3)) != 0; }
@@ -82,13 +95,9 @@ private:
     void _fifoPush(uint8_t val);
     uint8_t _arbCycles() const; // ceil(8/_dataWidth) - begin() 이후 값 불변, 사용은 캐시된 멤버로
 
-    // ---- ISR 핫패스 캐시 (begin()에서 1회 계산, 이후 절대 재계산 안 함) ----
-    // _dataWidth는 begin() 호출 뒤로는 바뀌지 않으므로, 매 CLK 엣지마다
-    // 나눗셈/시프트를 다시 하는 대신 미리 계산해둔 값만 읽는다.
-    // (AVR은 나눗셈 명령이 없고, 가변 시프트도 시프트량만큼 반복하는 소프트웨어 루프라
-    //  둘 다 느리다.)
+    // ---- ISR 핫패스 캐시 ----
     uint8_t _arbCyclesCached; // = ceil(8/_dataWidth)
     uint8_t _dataMaskCached;  // = (1 << _dataWidth) - 1
-    uint8_t _dataTopBitCached; // = 1 << (_dataWidth - 1) : _driveDataChunk의 시작 비트 (가변 시프트를 1회로 제한)
+    uint8_t _dataTopBitCached; // W1/2/4는 내부에서 상수로 처리하므로 W8 한정으로만 실질 사용
 };
 #endif

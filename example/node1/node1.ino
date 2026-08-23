@@ -8,8 +8,8 @@
 
 
 // you can select Data Pins and Data Bus Width.
-uint8_t dataPins[] = {4, 5, 6, 7};  // if you want to use Analog Pins, you can code like this: uint8_t dataPins[] = {A0, A1, A2, A3};
-const uint8_t WIDTH = 4;
+uint8_t dataPins[] = { 4 };  // if you want to use Analog Pins, you can code like this: uint8_t dataPins[] = {A0, A1, A2, A3};
+const uint8_t WIDTH = 1;
 
 // My node ID: 0x01
 SWP2P node(0x01);
@@ -24,7 +24,7 @@ void setup() {
     Serial.begin(115200);
     while (!Serial);
 
-    node.begin(true, dataPins, WIDTH, 29900UL);
+    node.begin(true, dataPins, WIDTH, 35000UL);
     // 'true' means this node generates Timer1 CTC CLK in D9. false means this node receives CLK from external source (D2).
     // you have to connect D9 to D2 with jumper wire if you set 'true'.
     // without pull-up resistors, the maximum clock frequency that the example 'master.ino' can transmit is approximately 76kHz
