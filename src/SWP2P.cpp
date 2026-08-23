@@ -8,43 +8,26 @@
 static_assert((SWP2P_FIFO_DEPTH & (SWP2P_FIFO_DEPTH - 1)) == 0, "SWP2P_FIFO_DEPTH must be a power of 2");
 
 // 고정 핀 (하드웨어 제약: INT0=D2, INT1=D3, PCINT0 그룹의 D8)
+// PIN_BUSY_N/PIN_ACK_N은 이제 코드 동작에 직접 쓰이지 않는다 (헤더의 inline static
+// 함수들이 PORTD bit3 / PORTB bit0으로 하드코딩되어 있음) — 문서화 목적으로만 남겨둔다.
 #define PIN_CLK    2
-#define PIN_BUSY_N 3
-#define PIN_ACK_N  8
+#define PIN_BUSY_N 3   // = PORTD bit 3 (헤더 _busyDriveLow 등과 반드시 일치해야 함)
+#define PIN_ACK_N  8   // = PORTB bit 0 (헤더 _ackDriveLow 등과 반드시 일치해야 함)
 
 SWP2P* SWP2P::_instance = nullptr;
 
 SWP2P::SWP2P(uint8_t nodeId)
-    : _nodeId(nodeId),
-      _clkIsOutput(false),
-      _dataPins(nullptr),
-      _dataWidth(1),
-      _clkFreq(100000UL),
-      _isSending(false),
-      _isBusy(false),
-      _rxHead(0),
-      _rxTail(0),
-      _rxCount(0),
-      _txState(TX_IDLE),
-      _txDestId(0),
-      _txData(0),
-      _arbChunkIdx(-1),
-      _arbMyChunk(0),
-      _txDataChunkIdx(-1),
-      _rxState(RX_IDLE),
-      _rxAddrByte(0),
-      _rxDataByte(0),
-      _rxAddrChunkIdx(-1),
-      _rxDataChunkIdx(-1),
-      _isMyPacket(false),
-      _rxCapturedThisFrame(false)
-{
+    : _nodeId(nodeId), _clkIsOutput(false), _dataPins(nullptr), _dataWidth(1),
+      _clkFreq(100000UL), _isSending(false), _isBusy(false),
+      _rxHead(0), _rxTail(0), _rxCount(0),
+      _txState(TX_IDLE), _txDestId(0), _txData(0), _arbChunkIdx(-1), _arbMyChunk(0), _txDataChunkIdx(-1),
+      _rxState(RX_IDLE), _rxAddrByte(0), _rxDataByte(0), _rxAddrChunkIdx(-1), _rxDataChunkIdx(-1),
+      _isMyPacket(false), _rxCapturedThisFrame(false) {
     _instance = this;
 }
 
 // ---------------- 핀 -> 레지스터 캐싱 (begin()에서 1회만 실행, 이후 ISR은 포인터만 역참조) ----------------
-void SWP2P::_cachePinFast(uint8_t pinNum, PinFast& out)
-{
+void SWP2P::_cachePinFast(uint8_t pinNum, PinFast& out) {
     uint8_t port = digitalPinToPort(pinNum);
     out.ddr  = portModeRegister(port);
     out.port = portOutputRegister(port);
@@ -52,58 +35,24 @@ void SWP2P::_cachePinFast(uint8_t pinNum, PinFast& out)
     out.mask = digitalPinToBitMask(pinNum);
 }
 
-// ---------------- open-drain 헬퍼 (전부 포트 레지스터 직접 접근, digitalWrite/pinMode 미사용) ----------------
-void SWP2P::_busyDriveLow()
-{
-    *_busyFast.port &= ~_busyFast.mask;
-    *_busyFast.ddr |= _busyFast.mask;
-}
+// ---------------- open-drain 헬퍼 ----------------
+// BUSY_N/ACK_N은 헤더에 inline static으로 옮겨졌다 (컴파일타임 고정 핀 최적화).
+// 여기서는 DATA_BUS(런타임 가변 핀)만 다룬다.
 
-void SWP2P::_busyRelease()
-{
-    *_busyFast.ddr &= ~_busyFast.mask;
-    *_busyFast.port |= _busyFast.mask; // INPUT_PULLUP
-}
-
-bool SWP2P::_busyRead()
-{
-    return (*_busyFast.pin & _busyFast.mask) != 0;
-}
-
-void SWP2P::_ackDriveLow()
-{
-    *_ackFast.port &= ~_ackFast.mask;
-    *_ackFast.ddr |= _ackFast.mask;
-}
-
-void SWP2P::_ackRelease()
-{
-    *_ackFast.ddr &= ~_ackFast.mask;
-    *_ackFast.port |= _ackFast.mask;
-}
-
-bool SWP2P::_ackRead()
-{
-    return (*_ackFast.pin & _ackFast.mask) != 0;
-}
-
-void SWP2P::_driveDataChunk(uint8_t chunkVal)
-{
+void SWP2P::_driveDataChunk(uint8_t chunkVal) {
+    // 가변 시프트(연산량이 시프트 폭에 비례하는 소프트웨어 루프)는 여기서 딱 1번만 쓴다
+    // (_dataTopBitCached는 begin()에서 이미 계산해둔 값이라 사실상 이 함수 안에서는 0번).
+    // 이후로는 매 반복 1비트씩만 이동하는 고정 시프트(`bit >>= 1`)만 쓰므로 항상 1사이클이다.
+    uint8_t bit = _dataTopBitCached;
     for (uint8_t i = 0; i < _dataWidth; i++) {
-        bool bitVal = (chunkVal >> (_dataWidth - 1 - i)) & 0x01;
+        bool bitVal = (chunkVal & bit) != 0;
         PinFast& p = _dataPinFast[i];
-        if (bitVal) {
-            *p.ddr &= ~p.mask;
-            *p.port |= p.mask; // 1 = release (INPUT_PULLUP)
-        } else {
-            *p.port &= ~p.mask;
-            *p.ddr |= p.mask;  // 0 = 구동 (OUTPUT LOW)
-        }
+        if (bitVal) { *p.ddr &= ~p.mask; *p.port &= ~p.mask; }   // 1 = release (순수 플로팅, 외부 풀업만 의존)
+        else        { *p.port &= ~p.mask; *p.ddr |= p.mask; }  // 0 = 구동 (OUTPUT LOW)
+        bit >>= 1;
     }
 }
-
-uint8_t SWP2P::_readDataChunk()
-{
+uint8_t SWP2P::_readDataChunk() {
     uint8_t val = 0;
     for (uint8_t i = 0; i < _dataWidth; i++) {
         val <<= 1;
@@ -111,37 +60,29 @@ uint8_t SWP2P::_readDataChunk()
     }
     return val;
 }
-
-void SWP2P::_dataRelease()
-{
+void SWP2P::_dataRelease() {
     for (uint8_t i = 0; i < _dataWidth; i++) {
         PinFast& p = _dataPinFast[i];
         *p.ddr &= ~p.mask;
-        *p.port |= p.mask;
+        *p.port &= ~p.mask;
     }
 }
 
-uint8_t SWP2P::_arbCycles() const
-{
-    return (8 + _dataWidth - 1) / _dataWidth;
-}
+uint8_t SWP2P::_arbCycles() const { return (8 + _dataWidth - 1) / _dataWidth; }
 
 // ---------------- begin ----------------
-void SWP2P::begin(bool clkIsOutput, uint8_t* dataPins, uint8_t dataWidth, unsigned long clkFreq)
-{
+void SWP2P::begin(bool clkIsOutput, uint8_t* dataPins, uint8_t dataWidth, unsigned long clkFreq) {
     _clkIsOutput = clkIsOutput;
     _dataPins = dataPins;
     _dataWidth = (dataWidth == 0) ? 1 : dataWidth;
     _clkFreq = clkFreq;
 
-    pinMode(PIN_CLK, INPUT_PULLUP);
-    _cachePinFast(PIN_BUSY_N, _busyFast);
-    _cachePinFast(PIN_ACK_N, _ackFast);
-
+    pinMode(PIN_CLK, INPUT); // 내부 풀업 미사용 (외부 풀업 저항 하나로만 버스 RC 특성을 결정)
+    // BUSY_N(D3)/ACK_N(D8)은 이제 헤더의 inline static 함수가 컴파일타임 상수로 직접
+    // 레지스터를 조작하므로 PinFast 캐싱이 필요 없다 (DATA_BUS만 런타임 캐싱 대상).
     for (uint8_t i = 0; i < _dataWidth; i++) {
         _cachePinFast(_dataPins[i], _dataPinFast[i]);
     }
-
     _busyRelease();
     _ackRelease();
     _dataRelease();
@@ -149,6 +90,7 @@ void SWP2P::begin(bool clkIsOutput, uint8_t* dataPins, uint8_t dataWidth, unsign
     // ISR 핫패스 캐시: 나눗셈/시프트 결과를 1회만 계산해둔다 (매 클럭 엣지마다 재계산 방지)
     _arbCyclesCached = _arbCycles();
     _dataMaskCached  = (1 << _dataWidth) - 1;
+    _dataTopBitCached = (uint8_t)(1 << (_dataWidth - 1));
 
     if (_clkIsOutput) {
         pinMode(9, OUTPUT); // Timer1 OC1A -> D2로 점퍼선 연결 필요
@@ -172,31 +114,20 @@ void SWP2P::begin(bool clkIsOutput, uint8_t* dataPins, uint8_t dataWidth, unsign
     sei();
 }
 
-void SWP2P::setupTimer1(unsigned long freq)
-{
+void SWP2P::setupTimer1(unsigned long freq) {
     TCCR1A = 0;
     TCCR1B = 0;
     TCNT1  = 0;
-
     uint16_t ocrValue = (uint16_t)((F_CPU / (2UL * freq)) - 1);
     OCR1A = ocrValue;
-
     TCCR1A |= (1 << COM1A0);              // Toggle OC1A on Compare Match
     TCCR1B |= (1 << WGM12) | (1 << CS10); // CTC, no prescale
 }
-
-void SWP2P::stopTimer1()
-{
-    TCCR1B = 0;
-}
+void SWP2P::stopTimer1() { TCCR1B = 0; }
 
 // ---------------- 사용자 API ----------------
-bool SWP2P::send(uint8_t destId, uint8_t data)
-{
-    if (_isSending || _isBusy) {
-        return false; // 내부 가드
-    }
-
+bool SWP2P::send(uint8_t destId, uint8_t data) {
+    if (_isSending || _isBusy) return false; // 내부 가드
     _txDestId = destId;
     _txData = data;
     // 여기서 곧바로 busyDriveLow()를 호출하지 않는다.
@@ -210,41 +141,27 @@ bool SWP2P::send(uint8_t destId, uint8_t data)
     return true;
 }
 
-bool SWP2P::available()
-{
-    return _rxCount > 0;
-}
+bool SWP2P::available() { return _rxCount > 0; }
 
-uint8_t SWP2P::read()
-{
-    if (_rxCount == 0) {
-        return 0;
-    }
-
+uint8_t SWP2P::read() {
+    if (_rxCount == 0) return 0;
     uint8_t val = _rxFifo[_rxTail];
     _rxTail = (_rxTail + 1) & (SWP2P_FIFO_DEPTH - 1);
-
     noInterrupts();
     _rxCount--;
     interrupts();
-
     return val;
 }
 
-void SWP2P::_fifoPush(uint8_t val)
-{
-    if (_rxCount >= SWP2P_FIFO_DEPTH) {
-        return; // full -> drop
-    }
-
+void SWP2P::_fifoPush(uint8_t val) {
+    if (_rxCount >= SWP2P_FIFO_DEPTH) return; // full -> drop
     _rxFifo[_rxHead] = val;
     _rxHead = (_rxHead + 1) & (SWP2P_FIFO_DEPTH - 1);
     _rxCount++;
 }
 
 // ---------------- CLK 엣지: 상승=Tx 스텝, 하강=Rx 스텝 ----------------
-void SWP2P::_onClkEdge()
-{
+void SWP2P::_onClkEdge() {
     bool clkHigh = (PIND & (1 << PIN_CLK)) != 0; // PIN_CLK=D2 -> PORTD 고정 상수라 직접 접근
 
     if (clkHigh) {
@@ -278,9 +195,7 @@ void SWP2P::_onClkEdge()
                     _driveDataChunk((_txData >> shift0) & _dataMaskCached);
                     _txDataChunkIdx--;
                     _txState = TX_DATA;
-                    if (_txDataChunkIdx < 0) {
-                        _txState = TX_RELEASE;
-                    }
+                    if (_txDataChunkIdx < 0) _txState = TX_RELEASE;
                     break;
                 }
                 // 이 클럭에는 "구동만" 한다. 검증(되읽기)은 반클럭 뒤 negedge에서 -
@@ -293,33 +208,25 @@ void SWP2P::_onClkEdge()
             }
             case TX_DATA: {
                 // TX_ARB(혹은 TX_PENDING)에서 이미 첫 청크는 구동해뒀으므로, 여기서는 다음 청크부터 처리
-                if (_txDataChunkIdx < 0) {
-                    _txState = TX_RELEASE;
-                    break;
-                }
+                if (_txDataChunkIdx < 0) { _txState = TX_RELEASE; break; }
                 uint8_t shift = _txDataChunkIdx * _dataWidth;
                 uint8_t chunk = (_txData >> shift) & _dataMaskCached;
                 _driveDataChunk(chunk);
                 _txDataChunkIdx--;
-                if (_txDataChunkIdx < 0) {
-                    _txState = TX_RELEASE;
-                }
+                if (_txDataChunkIdx < 0) _txState = TX_RELEASE;
                 break;
             }
-            case TX_RELEASE: {
+            case TX_RELEASE:
                 _dataRelease();
                 _txState = TX_DONE;
                 break;
-            }
-            case TX_DONE: {
+            case TX_DONE:
                 _busyRelease();
                 _isSending = false;
                 _txState = TX_IDLE;
                 break;
-            }
-            default: {
+            default:
                 break;
-            }
         }
     } else {
         // Rx 스텝 (negedge)
@@ -337,16 +244,11 @@ void SWP2P::_onClkEdge()
             }
             return;
         }
-
-        if (_txState != TX_IDLE) {
-            return; // 내가 pending/데이터/release/done 진행 중이면 수신 로직 skip
-        }
+        if (_txState != TX_IDLE) return; // 내가 pending/데이터/release/done 진행 중이면 수신 로직 skip
 
         switch (_rxState) {
             case RX_ADDR: {
-                if (_rxAddrChunkIdx < 0) {
-                    _rxAddrChunkIdx = _arbCyclesCached - 1; // 프레임 첫 진입
-                }
+                if (_rxAddrChunkIdx < 0) _rxAddrChunkIdx = _arbCyclesCached - 1; // 프레임 첫 진입
                 uint8_t v = _readDataChunk();
                 _rxAddrByte = (_rxAddrByte << _dataWidth) | v;
                 _rxAddrChunkIdx--;
@@ -373,20 +275,17 @@ void SWP2P::_onClkEdge()
                 }
                 break;
             }
-            case RX_ACK: {
+            case RX_ACK:
                 _ackDriveLow(); // 1클럭 폭 ACK 시작 (HIGH 복귀는 _onBusyEdge의 idle 처리에서)
                 _rxState = RX_IDLE;
                 break;
-            }
-            default: {
+            default:
                 break;
-            }
         }
     }
 }
 
-void SWP2P::_onBusyEdge()
-{
+void SWP2P::_onBusyEdge() {
     bool idle = _busyRead();
     _isBusy = !idle;
 
@@ -405,19 +304,14 @@ void SWP2P::_onBusyEdge()
             _isSending = true;
         }
     } else {
-        if (_txState == TX_IDLE) {
-            _rxState = RX_ADDR;
-        }
+        if (_txState == TX_IDLE) _rxState = RX_ADDR;
     }
 }
 
-void SWP2P::_onAckEdge()
-{
+void SWP2P::_onAckEdge() {
     // PCINT는 CHANGE 전용이라 HIGH 복귀에도 걸림 - 레벨로 걸러낸다
     bool ackHigh = _ackRead();
-    if (ackHigh) {
-        return; // 상승엣지(ACK 종료) - 무시
-    }
+    if (ackHigh) return; // 상승엣지(ACK 종료) - 무시
 
     // 하강엣지(ACK 시작) - 송신자 입장에서 "상대가 확인했다"는 신호
     // v0.1: 송신 완료 자체는 이미 TX_DONE에서 처리되므로 여기서는 자리만 유지
@@ -425,23 +319,6 @@ void SWP2P::_onAckEdge()
 }
 
 // ---------------- ISR 트램폴린 ----------------
-ISR(INT0_vect)
-{
-    if (SWP2P::_instance) {
-        SWP2P::_instance->_onClkEdge();
-    }
-}
-
-ISR(INT1_vect)
-{
-    if (SWP2P::_instance) {
-        SWP2P::_instance->_onBusyEdge();
-    }
-}
-
-ISR(PCINT0_vect)
-{
-    if (SWP2P::_instance) {
-        SWP2P::_instance->_onAckEdge();
-    }
-}
+ISR(INT0_vect) { if (SWP2P::_instance) SWP2P::_instance->_onClkEdge(); }
+ISR(INT1_vect) { if (SWP2P::_instance) SWP2P::_instance->_onBusyEdge(); }
+ISR(PCINT0_vect) { if (SWP2P::_instance) SWP2P::_instance->_onAckEdge(); }
