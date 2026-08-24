@@ -24,13 +24,10 @@ void setup() {
     Serial.begin(115200);
     while (!Serial);
 
-    node.begin(true, dataPins, WIDTH, 60000UL);
+    node.begin(true, dataPins, WIDTH, 66000UL);
     // 'true' means this node generates Timer1 CTC CLK in D9. false means this node receives CLK from external source (D2).
     // you have to connect D9 to D2 with jumper wire if you set 'true'.
-    // without pull-up resistors, the maximum clock frequency that the example 'master.ino' can transmit is approximately 76kHz
-    // with pull-up resistors, the maximum clock frequency that the example 'slave.ino' can receive is approximately 60kHz
-    // This is because the pull-up resistors make the rise time of the Pins slower,
-    // which limits the maximum clock frequency, exspecially when the node is receiving data.
+    // with pull-up resistors(1K~4.7k), the maximum clock frequency that the example 'slave.ino' can receive is approximately 66kHz
     Serial.println(F("=== SWP2P Node 0x01 Initialized (CLK Generator) ==="));
 
 }

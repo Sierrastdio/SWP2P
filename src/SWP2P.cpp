@@ -2,7 +2,6 @@
 
 static_assert((SWP2P_FIFO_DEPTH & (SWP2P_FIFO_DEPTH - 1)) == 0, "SWP2P_FIFO_DEPTH must be a power of 2");
 
-// Global & Volatile variables for ultrafast ISR access
 static uint8_t g_nodeId = 0;
 static bool g_clkIsOutput = false;
 static unsigned long g_clkFreq = 40000UL;
@@ -31,7 +30,7 @@ static int8_t g_rxDataChunkIdx = -1;
 static bool g_isMyPacket = false;
 static bool g_rxCapturedThisFrame = false;
 
-// Fast Inline Macro Utilities
+// Fast Direct Control Macros
 #define BUSY_DRIVE_LOW() { DDRD |= (1 << DDD3); PORTD &= ~(1 << PORTD3); }
 #define BUSY_RELEASE()   { DDRD &= ~(1 << DDD3); PORTD &= ~(1 << PORTD3); }
 #define BUSY_READ()      ((PIND & (1 << PIND3)) != 0)
@@ -42,10 +41,10 @@ static bool g_rxCapturedThisFrame = false;
 
 #define DATA_RELEASE()   { DDRD &= 0x0F; PORTD &= 0x0F; }
 
+// Data Pins: D4~D7
 static inline void DRIVE_DATA_CHUNK(uint8_t v) {
-    uint8_t inv = (~v) & 0x0F;
-    PORTD &= 0x0F;
-    DDRD = (DDRD & 0x0F) | (inv << 4);
+    DDRD |= 0xF0;
+    PORTD = (PORTD & 0x0F) | ((v & 0x0F) << 4);
 }
 
 static inline uint8_t READ_DATA_CHUNK() {
@@ -67,7 +66,6 @@ void SWP2P::begin(bool clkIsOutput, uint8_t* dataPins, uint8_t dataWidth, unsign
     g_clkIsOutput = clkIsOutput;
     g_clkFreq = clkFreq;
 
-    // D2 (CLK) Input Mode
     DDRD &= ~(1 << DDD2);
 
     BUSY_RELEASE();
@@ -75,19 +73,19 @@ void SWP2P::begin(bool clkIsOutput, uint8_t* dataPins, uint8_t dataWidth, unsign
     DATA_RELEASE();
 
     if (g_clkIsOutput) {
-        DDRB |= (1 << DDB1); // D9 (PB1 / OC1A) Output Mode
+        DDRB |= (1 << DDB1);
         setupTimer1(g_clkFreq);
     }
 
-    // INT0 (D2 - CLK) Any Logical Change Interrupt
+    // INT0 (CLK Any Logical Change)
     EICRA = (EICRA & ~((1 << ISC01) | (1 << ISC00))) | (1 << ISC00);
     EIMSK |= (1 << INT0);
 
-    // INT1 (D3 - BUSY) Any Logical Change Interrupt
+    // INT1 (BUSY Any Logical Change)
     EICRA = (EICRA & ~((1 << ISC11) | (1 << ISC10))) | (1 << ISC10);
     EIMSK |= (1 << INT1);
 
-    // PCINT0 (D8 - ACK) Pin Change Interrupt
+    // PCINT0 (ACK)
     PCICR |= (1 << PCIE0);
     PCMSK0 |= (1 << PCINT0);
 
@@ -100,8 +98,8 @@ void SWP2P::setupTimer1(unsigned long freq) {
     TCNT1  = 0;
     uint16_t ocrValue = (uint16_t)((F_CPU / (2UL * freq)) - 1);
     OCR1A = ocrValue;
-    TCCR1A |= (1 << COM1A0);             // Toggle OC1A on Compare Match
-    TCCR1B |= (1 << WGM12) | (1 << CS10); // CTC Mode, No Prescaler
+    TCCR1A |= (1 << COM1A0);
+    TCCR1B |= (1 << WGM12) | (1 << CS10);
 }
 
 void SWP2P::stopTimer1() {
@@ -137,7 +135,6 @@ uint8_t SWP2P::read() {
 bool SWP2P::isSending() const { return g_isSending; }
 bool SWP2P::isBusy() const { return g_isBusy; }
 
-// Direct Ultra-Fast Interrupt Service Routines
 ISR(INT0_vect) {
     bool clkHigh = (PIND & (1 << PIND2)) != 0;
 
@@ -172,7 +169,6 @@ ISR(INT0_vect) {
                 }
                 DRIVE_DATA_CHUNK(g_txData & 0x0F);
                 g_txDataChunkIdx--;
-                g_txState = SWP2P::TX_RELEASE;
                 break;
             }
             case SWP2P::TX_RELEASE:
@@ -189,6 +185,7 @@ ISR(INT0_vect) {
         }
     } else {
         if (g_txState == SWP2P::TX_ARB) {
+            asm volatile("nop\n\tnop\n\tnop\n\tnop\n\t");
             uint8_t busVal = READ_DATA_CHUNK();
             if ((g_arbMyChunk & ~busVal) != 0) {
                 DATA_RELEASE();
@@ -200,13 +197,21 @@ ISR(INT0_vect) {
             }
             return;
         }
+
         if (g_txState != SWP2P::TX_IDLE) return;
+
+        // Signal Settling Delay for High Speed RX
+        //asm volatile("nop\n\tnop\n\tnop\n\tnop\n\t");
+        // 4.7K 대신 1K를 써보고 있기 때문에 이건 주석처리.
 
         switch (g_rxState) {
             case SWP2P::RX_ADDR: {
-                if (g_rxAddrChunkIdx < 0) g_rxAddrChunkIdx = 1;
+                if (g_rxAddrChunkIdx < 0) {
+                    g_rxAddrChunkIdx = 1;
+                    g_rxAddrByte = 0;
+                }
                 uint8_t v = READ_DATA_CHUNK();
-                g_rxAddrByte = (g_rxAddrByte << 4) | v;
+                g_rxAddrByte = (g_rxAddrByte << 4) | (v & 0x0F);
                 g_rxAddrChunkIdx--;
                 if (g_rxAddrChunkIdx < 0) {
                     g_isMyPacket = (g_rxAddrByte == g_nodeId || g_rxAddrByte == 0xFF);
@@ -218,7 +223,7 @@ ISR(INT0_vect) {
             }
             case SWP2P::RX_DATA: {
                 uint8_t v = READ_DATA_CHUNK();
-                g_rxDataByte = (g_rxDataByte << 4) | v;
+                g_rxDataByte = (g_rxDataByte << 4) | (v & 0x0F);
                 g_rxDataChunkIdx--;
                 if (g_rxDataChunkIdx < 0) {
                     if (g_isMyPacket && !g_rxCapturedThisFrame) {
