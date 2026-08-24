@@ -1,168 +1,93 @@
 #include "SWP2P.h"
 
-// FIFO depth는 반드시 2의 거듭제곱이어야 한다.
 static_assert((SWP2P_FIFO_DEPTH & (SWP2P_FIFO_DEPTH - 1)) == 0, "SWP2P_FIFO_DEPTH must be a power of 2");
 
-#define PIN_CLK    2
-#define PIN_BUSY_N 3   // = PORTD bit 3
-#define PIN_ACK_N  8   // = PORTB bit 0
+// Global & Volatile variables for ultrafast ISR access
+static uint8_t g_nodeId = 0;
+static bool g_clkIsOutput = false;
+static unsigned long g_clkFreq = 40000UL;
 
-SWP2P* SWP2P::_instance = nullptr;
+static volatile bool g_isSending = false;
+static volatile bool g_isBusy = false;
 
-SWP2P::SWP2P(uint8_t nodeId)
-    : _nodeId(nodeId), _clkIsOutput(false), _dataPins(nullptr), _dataWidth(1),
-      _clkFreq(100000UL), _isSending(false), _isBusy(false),
-      _rxHead(0), _rxTail(0), _rxCount(0),
-      _txState(TX_IDLE), _txDestId(0), _txData(0), _arbChunkIdx(-1), _arbMyChunk(0), _txDataChunkIdx(-1),
-      _rxState(RX_IDLE), _rxAddrByte(0), _rxDataByte(0), _rxAddrChunkIdx(-1), _rxDataChunkIdx(-1),
-      _isMyPacket(false), _rxCapturedThisFrame(false),
-      _driveFn(nullptr), _readFn(nullptr) {
-    _instance = this;
+static volatile uint8_t g_rxFifo[SWP2P_FIFO_DEPTH];
+static volatile uint8_t g_rxHead = 0;
+static volatile uint8_t g_rxTail = 0;
+static volatile uint8_t g_rxCount = 0;
+
+static volatile SWP2P::TxState g_txState = SWP2P::TX_IDLE;
+static uint8_t g_txDestId = 0;
+static uint8_t g_txData = 0;
+static int8_t g_arbChunkIdx = -1;
+static uint8_t g_arbMyChunk = 0;
+static int8_t g_txDataChunkIdx = -1;
+
+static volatile SWP2P::RxState g_rxState = SWP2P::RX_IDLE;
+static uint8_t g_rxAddrByte = 0;
+static uint8_t g_rxDataByte = 0;
+static int8_t g_rxAddrChunkIdx = -1;
+static int8_t g_rxDataChunkIdx = -1;
+
+static bool g_isMyPacket = false;
+static bool g_rxCapturedThisFrame = false;
+
+// Fast Inline Macro Utilities
+#define BUSY_DRIVE_LOW() { DDRD |= (1 << DDD3); PORTD &= ~(1 << PORTD3); }
+#define BUSY_RELEASE()   { DDRD &= ~(1 << DDD3); PORTD &= ~(1 << PORTD3); }
+#define BUSY_READ()      ((PIND & (1 << PIND3)) != 0)
+
+#define ACK_DRIVE_LOW()  { DDRB |= (1 << DDB0); PORTB &= ~(1 << PORTB0); }
+#define ACK_RELEASE()    { DDRB &= ~(1 << DDB0); PORTB &= ~(1 << PORTB0); }
+#define ACK_READ()       ((PINB & (1 << PINB0)) != 0)
+
+#define DATA_RELEASE()   { DDRD &= 0x0F; PORTD &= 0x0F; }
+
+static inline void DRIVE_DATA_CHUNK(uint8_t v) {
+    uint8_t inv = (~v) & 0x0F;
+    PORTD &= 0x0F;
+    DDRD = (DDRD & 0x0F) | (inv << 4);
 }
 
-void SWP2P::_cachePinFast(uint8_t pinNum, PinFast& out) {
-    uint8_t port = digitalPinToPort(pinNum);
-    out.ddr  = portModeRegister(port);
-    out.port = portOutputRegister(port);
-    out.pin  = portInputRegister(port);
-    out.mask = digitalPinToBitMask(pinNum);
+static inline uint8_t READ_DATA_CHUNK() {
+    return (PIND >> 4) & 0x0F;
 }
 
-// ==================== WIDTH별 언롤 구현 ====================
-// 전부 루프 없이 몸으로 직접 풀어씀. p[i]는 begin()에서 이미 캐싱된 포인터라
-// 여기서는 역참조 8줄(최대) 이하의 고정 명령만 실행된다.
-
-// ---- WIDTH = 1 ----
-void SWP2P::_drive_W1(PinFast* p, uint8_t v) {
-    if (v & 0x01) { *p[0].ddr &= ~p[0].mask; *p[0].port &= ~p[0].mask; }
-    else          { *p[0].port &= ~p[0].mask; *p[0].ddr |= p[0].mask; }
-}
-uint8_t SWP2P::_read_W1(PinFast* p) {
-    return (*p[0].pin & p[0].mask) ? 1 : 0;
+static inline void FIFO_PUSH(uint8_t val) {
+    if (g_rxCount >= SWP2P_FIFO_DEPTH) return;
+    g_rxFifo[g_rxHead] = val;
+    g_rxHead = (g_rxHead + 1) & (SWP2P_FIFO_DEPTH - 1);
+    g_rxCount++;
 }
 
-// ---- WIDTH = 2 ----
-void SWP2P::_drive_W2(PinFast* p, uint8_t v) {
-    if (v & 0x02) { *p[0].ddr &= ~p[0].mask; *p[0].port &= ~p[0].mask; }
-    else          { *p[0].port &= ~p[0].mask; *p[0].ddr |= p[0].mask; }
-    if (v & 0x01) { *p[1].ddr &= ~p[1].mask; *p[1].port &= ~p[1].mask; }
-    else          { *p[1].port &= ~p[1].mask; *p[1].ddr |= p[1].mask; }
-}
-uint8_t SWP2P::_read_W2(PinFast* p) {
-    uint8_t val = (*p[0].pin & p[0].mask) ? 1 : 0;
-    val = (val << 1) | ((*p[1].pin & p[1].mask) ? 1 : 0);
-    return val;
+SWP2P::SWP2P(uint8_t nodeId) {
+    g_nodeId = nodeId;
 }
 
-// ---- WIDTH = 4 ----
-void SWP2P::_drive_W4(PinFast* p, uint8_t v) {
-    if (v & 0x08) { *p[0].ddr &= ~p[0].mask; *p[0].port &= ~p[0].mask; }
-    else          { *p[0].port &= ~p[0].mask; *p[0].ddr |= p[0].mask; }
-    if (v & 0x04) { *p[1].ddr &= ~p[1].mask; *p[1].port &= ~p[1].mask; }
-    else          { *p[1].port &= ~p[1].mask; *p[1].ddr |= p[1].mask; }
-    if (v & 0x02) { *p[2].ddr &= ~p[2].mask; *p[2].port &= ~p[2].mask; }
-    else          { *p[2].port &= ~p[2].mask; *p[2].ddr |= p[2].mask; }
-    if (v & 0x01) { *p[3].ddr &= ~p[3].mask; *p[3].port &= ~p[3].mask; }
-    else          { *p[3].port &= ~p[3].mask; *p[3].ddr |= p[3].mask; }
-}
-uint8_t SWP2P::_read_W4(PinFast* p) {
-    uint8_t val = (*p[0].pin & p[0].mask) ? 1 : 0;
-    val = (val << 1) | ((*p[1].pin & p[1].mask) ? 1 : 0);
-    val = (val << 1) | ((*p[2].pin & p[2].mask) ? 1 : 0);
-    val = (val << 1) | ((*p[3].pin & p[3].mask) ? 1 : 0);
-    return val;
-}
-
-// ---- WIDTH = 8 ----
-void SWP2P::_drive_W8(PinFast* p, uint8_t v) {
-    if (v & 0x80) { *p[0].ddr &= ~p[0].mask; *p[0].port &= ~p[0].mask; }
-    else          { *p[0].port &= ~p[0].mask; *p[0].ddr |= p[0].mask; }
-    if (v & 0x40) { *p[1].ddr &= ~p[1].mask; *p[1].port &= ~p[1].mask; }
-    else          { *p[1].port &= ~p[1].mask; *p[1].ddr |= p[1].mask; }
-    if (v & 0x20) { *p[2].ddr &= ~p[2].mask; *p[2].port &= ~p[2].mask; }
-    else          { *p[2].port &= ~p[2].mask; *p[2].ddr |= p[2].mask; }
-    if (v & 0x10) { *p[3].ddr &= ~p[3].mask; *p[3].port &= ~p[3].mask; }
-    else          { *p[3].port &= ~p[3].mask; *p[3].ddr |= p[3].mask; }
-    if (v & 0x08) { *p[4].ddr &= ~p[4].mask; *p[4].port &= ~p[4].mask; }
-    else          { *p[4].port &= ~p[4].mask; *p[4].ddr |= p[4].mask; }
-    if (v & 0x04) { *p[5].ddr &= ~p[5].mask; *p[5].port &= ~p[5].mask; }
-    else          { *p[5].port &= ~p[5].mask; *p[5].ddr |= p[5].mask; }
-    if (v & 0x02) { *p[6].ddr &= ~p[6].mask; *p[6].port &= ~p[6].mask; }
-    else          { *p[6].port &= ~p[6].mask; *p[6].ddr |= p[6].mask; }
-    if (v & 0x01) { *p[7].ddr &= ~p[7].mask; *p[7].port &= ~p[7].mask; }
-    else          { *p[7].port &= ~p[7].mask; *p[7].ddr |= p[7].mask; }
-}
-uint8_t SWP2P::_read_W8(PinFast* p) {
-    uint8_t val = (*p[0].pin & p[0].mask) ? 1 : 0;
-    val = (val << 1) | ((*p[1].pin & p[1].mask) ? 1 : 0);
-    val = (val << 1) | ((*p[2].pin & p[2].mask) ? 1 : 0);
-    val = (val << 1) | ((*p[3].pin & p[3].mask) ? 1 : 0);
-    val = (val << 1) | ((*p[4].pin & p[4].mask) ? 1 : 0);
-    val = (val << 1) | ((*p[5].pin & p[5].mask) ? 1 : 0);
-    val = (val << 1) | ((*p[6].pin & p[6].mask) ? 1 : 0);
-    val = (val << 1) | ((*p[7].pin & p[7].mask) ? 1 : 0);
-    return val;
-}
-
-void SWP2P::_dataRelease() {
-    for (uint8_t i = 0; i < _dataWidth; i++) {
-        PinFast& p = _dataPinFast[i];
-        *p.ddr &= ~p.mask;
-        *p.port &= ~p.mask;
-    }
-}
-
-uint8_t SWP2P::_arbCycles() const { return (8 + _dataWidth - 1) / _dataWidth; }
-
-// ---------------- begin ----------------
 void SWP2P::begin(bool clkIsOutput, uint8_t* dataPins, uint8_t dataWidth, unsigned long clkFreq) {
-    _clkIsOutput = clkIsOutput;
-    _dataPins = dataPins;
-    _dataWidth = (dataWidth == 0) ? 1 : dataWidth;
-    _clkFreq = clkFreq;
+    g_clkIsOutput = clkIsOutput;
+    g_clkFreq = clkFreq;
 
-    pinMode(PIN_CLK, INPUT); // 내부 풀업 미사용
-    for (uint8_t i = 0; i < _dataWidth; i++) {
-        _cachePinFast(_dataPins[i], _dataPinFast[i]);
-    }
-    _busyRelease();
-    _ackRelease();
-    _dataRelease();
+    // D2 (CLK) Input Mode
+    DDRD &= ~(1 << DDD2);
 
-    _arbCyclesCached = _arbCycles();
-    _dataMaskCached  = (1 << _dataWidth) - 1;
-    _dataTopBitCached = (uint8_t)(1 << (_dataWidth - 1));
+    BUSY_RELEASE();
+    ACK_RELEASE();
+    DATA_RELEASE();
 
-    // WIDTH에 맞는 언롤 함수를 1회만 바인딩. 지원 목록: 1, 2, 4, 8.
-    // 그 외 값(3,5,6,7)이 들어오면 일단 가장 가까운 하위 지원폭으로 clamp하지 않고
-    // 명시적으로 8용 범용 폭에 맞추는 대신 여기서는 지원값만 쓰도록 강제한다.
-    switch (_dataWidth) {
-        case 1: _driveFn = &SWP2P::_drive_W1; _readFn = &SWP2P::_read_W1; break;
-        case 2: _driveFn = &SWP2P::_drive_W2; _readFn = &SWP2P::_read_W2; break;
-        case 4: _driveFn = &SWP2P::_drive_W4; _readFn = &SWP2P::_read_W4; break;
-        case 8: _driveFn = &SWP2P::_drive_W8; _readFn = &SWP2P::_read_W8; break;
-        default:
-            // 지원하지 않는 WIDTH: 가장 가까운 하위 지원값으로 강제하지 않고
-            // 8용 구현을 쓰되 상위 미사용 비트는 0으로 취급되도록 W8을 사용.
-            // (요구사항 밖의 값이 들어오면 일단 안전하게 fallback, 추후 static_assert로 강제 고려)
-            _driveFn = &SWP2P::_drive_W8;
-            _readFn = &SWP2P::_read_W8;
-            break;
+    if (g_clkIsOutput) {
+        DDRB |= (1 << DDB1); // D9 (PB1 / OC1A) Output Mode
+        setupTimer1(g_clkFreq);
     }
 
-    if (_clkIsOutput) {
-        pinMode(9, OUTPUT);
-        setupTimer1(_clkFreq);
-    }
-
-    EICRA &= ~((1 << ISC01) | (1 << ISC00));
-    EICRA |= (1 << ISC00);
+    // INT0 (D2 - CLK) Any Logical Change Interrupt
+    EICRA = (EICRA & ~((1 << ISC01) | (1 << ISC00))) | (1 << ISC00);
     EIMSK |= (1 << INT0);
 
-    EICRA &= ~((1 << ISC11) | (1 << ISC10));
-    EICRA |= (1 << ISC10);
+    // INT1 (D3 - BUSY) Any Logical Change Interrupt
+    EICRA = (EICRA & ~((1 << ISC11) | (1 << ISC10))) | (1 << ISC10);
     EIMSK |= (1 << INT1);
 
+    // PCINT0 (D8 - ACK) Pin Change Interrupt
     PCICR |= (1 << PCIE0);
     PCMSK0 |= (1 << PCINT0);
 
@@ -175,141 +100,140 @@ void SWP2P::setupTimer1(unsigned long freq) {
     TCNT1  = 0;
     uint16_t ocrValue = (uint16_t)((F_CPU / (2UL * freq)) - 1);
     OCR1A = ocrValue;
-    TCCR1A |= (1 << COM1A0);
-    TCCR1B |= (1 << WGM12) | (1 << CS10);
+    TCCR1A |= (1 << COM1A0);             // Toggle OC1A on Compare Match
+    TCCR1B |= (1 << WGM12) | (1 << CS10); // CTC Mode, No Prescaler
 }
-void SWP2P::stopTimer1() { TCCR1B = 0; }
 
-// ---------------- 사용자 API ----------------
+void SWP2P::stopTimer1() {
+    TCCR1B = 0;
+}
+
 bool SWP2P::send(uint8_t destId, uint8_t data) {
-    if (_isSending || _isBusy) return false;
-    _txDestId = destId;
-    _txData = data;
-    _txState = TX_PENDING;
-    _isSending = true;
+    if (g_isSending || g_isBusy) return false;
+    g_txDestId = destId;
+    g_txData = data;
+    g_txState = TX_PENDING;
+    g_isSending = true;
     return true;
 }
 
-bool SWP2P::available() { return _rxCount > 0; }
+bool SWP2P::available() {
+    return g_rxCount > 0;
+}
 
 uint8_t SWP2P::read() {
-    if (_rxCount == 0) return 0;
-    uint8_t val = _rxFifo[_rxTail];
-    _rxTail = (_rxTail + 1) & (SWP2P_FIFO_DEPTH - 1);
-    noInterrupts();
-    _rxCount--;
-    interrupts();
+    if (g_rxCount == 0) return 0;
+    uint8_t val = g_rxFifo[g_rxTail];
+    g_rxTail = (g_rxTail + 1) & (SWP2P_FIFO_DEPTH - 1);
+
+    uint8_t sreg = SREG;
+    cli();
+    g_rxCount--;
+    SREG = sreg;
+
     return val;
 }
 
-void SWP2P::_fifoPush(uint8_t val) {
-    if (_rxCount >= SWP2P_FIFO_DEPTH) return;
-    _rxFifo[_rxHead] = val;
-    _rxHead = (_rxHead + 1) & (SWP2P_FIFO_DEPTH - 1);
-    _rxCount++;
-}
+bool SWP2P::isSending() const { return g_isSending; }
+bool SWP2P::isBusy() const { return g_isBusy; }
 
-// ---------------- CLK 엣지 ----------------
-void SWP2P::_onClkEdge() {
-    bool clkHigh = (PIND & (1 << PIN_CLK)) != 0;
+// Direct Ultra-Fast Interrupt Service Routines
+ISR(INT0_vect) {
+    bool clkHigh = (PIND & (1 << PIND2)) != 0;
 
     if (clkHigh) {
-        if (_txState == TX_PENDING) {
-            _busyDriveLow();
-            _arbChunkIdx = _arbCyclesCached - 1;
-            _txState = TX_ARB;
+        if (g_txState == SWP2P::TX_PENDING) {
+            BUSY_DRIVE_LOW();
+            g_arbChunkIdx = 1;
+            g_txState = SWP2P::TX_ARB;
 
-            uint8_t shift = _arbChunkIdx * _dataWidth;
-            _arbMyChunk = (_txDestId >> shift) & _dataMaskCached;
-            _driveDataChunk(_arbMyChunk);
+            g_arbMyChunk = (g_txDestId >> 4) & 0x0F;
+            DRIVE_DATA_CHUNK(g_arbMyChunk);
             return;
         }
 
-        switch (_txState) {
-            case TX_ARB: {
-                if (_arbChunkIdx < 0) {
-                    _txDataChunkIdx = _arbCyclesCached - 1;
-                    uint8_t shift0 = _txDataChunkIdx * _dataWidth;
-                    _driveDataChunk((_txData >> shift0) & _dataMaskCached);
-                    _txDataChunkIdx--;
-                    _txState = TX_DATA;
-                    if (_txDataChunkIdx < 0) _txState = TX_RELEASE;
+        switch (g_txState) {
+            case SWP2P::TX_ARB: {
+                if (g_arbChunkIdx < 0) {
+                    g_txDataChunkIdx = 1;
+                    DRIVE_DATA_CHUNK((g_txData >> 4) & 0x0F);
+                    g_txDataChunkIdx--;
+                    g_txState = SWP2P::TX_DATA;
                     break;
                 }
-                uint8_t shift = _arbChunkIdx * _dataWidth;
-                _arbMyChunk = (_txDestId >> shift) & _dataMaskCached;
-                _driveDataChunk(_arbMyChunk);
+                g_arbMyChunk = (g_txDestId >> (g_arbChunkIdx * 4)) & 0x0F;
+                DRIVE_DATA_CHUNK(g_arbMyChunk);
                 break;
             }
-            case TX_DATA: {
-                if (_txDataChunkIdx < 0) { _txState = TX_RELEASE; break; }
-                uint8_t shift = _txDataChunkIdx * _dataWidth;
-                uint8_t chunk = (_txData >> shift) & _dataMaskCached;
-                _driveDataChunk(chunk);
-                _txDataChunkIdx--;
-                if (_txDataChunkIdx < 0) _txState = TX_RELEASE;
+            case SWP2P::TX_DATA: {
+                if (g_txDataChunkIdx < 0) {
+                    g_txState = SWP2P::TX_RELEASE;
+                    break;
+                }
+                DRIVE_DATA_CHUNK(g_txData & 0x0F);
+                g_txDataChunkIdx--;
+                g_txState = SWP2P::TX_RELEASE;
                 break;
             }
-            case TX_RELEASE:
-                _dataRelease();
-                _txState = TX_DONE;
+            case SWP2P::TX_RELEASE:
+                DATA_RELEASE();
+                g_txState = SWP2P::TX_DONE;
                 break;
-            case TX_DONE:
-                _busyRelease();
-                _isSending = false;
-                _txState = TX_IDLE;
+            case SWP2P::TX_DONE:
+                BUSY_RELEASE();
+                g_isSending = false;
+                g_txState = SWP2P::TX_IDLE;
                 break;
             default:
                 break;
         }
     } else {
-        // Rx 스텝 (negedge)
-        if (_txState == TX_ARB) {
-            uint8_t busVal = _readDataChunk();
-            if ((_arbMyChunk & ~busVal) != 0) {
-                _dataRelease();
-                _busyRelease();
-                _isSending = false;
-                _txState = TX_LOST;
+        if (g_txState == SWP2P::TX_ARB) {
+            uint8_t busVal = READ_DATA_CHUNK();
+            if ((g_arbMyChunk & ~busVal) != 0) {
+                DATA_RELEASE();
+                BUSY_RELEASE();
+                g_isSending = false;
+                g_txState = SWP2P::TX_LOST;
             } else {
-                _arbChunkIdx--;
+                g_arbChunkIdx--;
             }
             return;
         }
-        if (_txState != TX_IDLE) return;
+        if (g_txState != SWP2P::TX_IDLE) return;
 
-        switch (_rxState) {
-            case RX_ADDR: {
-                if (_rxAddrChunkIdx < 0) _rxAddrChunkIdx = _arbCyclesCached - 1;
-                uint8_t v = _readDataChunk();
-                _rxAddrByte = (_rxAddrByte << _dataWidth) | v;
-                _rxAddrChunkIdx--;
-                if (_rxAddrChunkIdx < 0) {
-                    _isMyPacket = (_rxAddrByte == _nodeId || _rxAddrByte == 0xFF);
-                    _rxDataChunkIdx = _arbCyclesCached - 1;
-                    _rxDataByte = 0;
-                    _rxState = RX_DATA;
+        switch (g_rxState) {
+            case SWP2P::RX_ADDR: {
+                if (g_rxAddrChunkIdx < 0) g_rxAddrChunkIdx = 1;
+                uint8_t v = READ_DATA_CHUNK();
+                g_rxAddrByte = (g_rxAddrByte << 4) | v;
+                g_rxAddrChunkIdx--;
+                if (g_rxAddrChunkIdx < 0) {
+                    g_isMyPacket = (g_rxAddrByte == g_nodeId || g_rxAddrByte == 0xFF);
+                    g_rxDataChunkIdx = 1;
+                    g_rxDataByte = 0;
+                    g_rxState = SWP2P::RX_DATA;
                 }
                 break;
             }
-            case RX_DATA: {
-                uint8_t v = _readDataChunk();
-                _rxDataByte = (_rxDataByte << _dataWidth) | v;
-                _rxDataChunkIdx--;
-                if (_rxDataChunkIdx < 0) {
-                    if (_isMyPacket && !_rxCapturedThisFrame) {
-                        _fifoPush(_rxDataByte);
-                        _rxCapturedThisFrame = true;
-                        _rxState = RX_ACK;
+            case SWP2P::RX_DATA: {
+                uint8_t v = READ_DATA_CHUNK();
+                g_rxDataByte = (g_rxDataByte << 4) | v;
+                g_rxDataChunkIdx--;
+                if (g_rxDataChunkIdx < 0) {
+                    if (g_isMyPacket && !g_rxCapturedThisFrame) {
+                        FIFO_PUSH(g_rxDataByte);
+                        g_rxCapturedThisFrame = true;
+                        g_rxState = SWP2P::RX_ACK;
                     } else {
-                        _rxState = RX_IDLE;
+                        g_rxState = SWP2P::RX_IDLE;
                     }
                 }
                 break;
             }
-            case RX_ACK:
-                _ackDriveLow();
-                _rxState = RX_IDLE;
+            case SWP2P::RX_ACK:
+                ACK_DRIVE_LOW();
+                g_rxState = SWP2P::RX_IDLE;
                 break;
             default:
                 break;
@@ -317,34 +241,28 @@ void SWP2P::_onClkEdge() {
     }
 }
 
-void SWP2P::_onBusyEdge() {
-    bool idle = _busyRead();
-    _isBusy = !idle;
+ISR(INT1_vect) {
+    bool idle = BUSY_READ();
+    g_isBusy = !idle;
 
     if (idle) {
-        _ackRelease();
-        _rxCapturedThisFrame = false;
-        _rxState = RX_IDLE;
-        _rxAddrChunkIdx = -1;
-        _rxDataChunkIdx = -1;
-        _rxAddrByte = 0;
+        ACK_RELEASE();
+        g_rxCapturedThisFrame = false;
+        g_rxState = SWP2P::RX_IDLE;
+        g_rxAddrChunkIdx = -1;
+        g_rxDataChunkIdx = -1;
+        g_rxAddrByte = 0;
 
-        if (_txState == TX_LOST) {
-            _txState = TX_PENDING;
-            _isSending = true;
+        if (g_txState == SWP2P::TX_LOST) {
+            g_txState = SWP2P::TX_PENDING;
+            g_isSending = true;
         }
     } else {
-        if (_txState == TX_IDLE) _rxState = RX_ADDR;
+        if (g_txState == SWP2P::TX_IDLE) g_rxState = SWP2P::RX_ADDR;
     }
 }
 
-void SWP2P::_onAckEdge() {
-    bool ackHigh = _ackRead();
+ISR(PCINT0_vect) {
+    bool ackHigh = ACK_READ();
     if (ackHigh) return;
-    // v0.1: 자리만 유지
 }
-
-// ---------------- ISR 트램폴린 ----------------
-ISR(INT0_vect) { if (SWP2P::_instance) SWP2P::_instance->_onClkEdge(); }
-ISR(INT1_vect) { if (SWP2P::_instance) SWP2P::_instance->_onBusyEdge(); }
-ISR(PCINT0_vect) { if (SWP2P::_instance) SWP2P::_instance->_onAckEdge(); }

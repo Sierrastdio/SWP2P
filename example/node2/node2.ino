@@ -8,8 +8,8 @@
 
 
 // you can select Data Pins and Data Bus Width.
-uint8_t dataPins[] = { 4 };  // if you want to use Analog Pins, you can code like this: uint8_t dataPins[] = {A0, A1, A2, A3};
-const uint8_t WIDTH = 1;
+uint8_t dataPins[] = { 4, 5 ,6, 7 };  // if you want to use Analog Pins, you can code like this: uint8_t dataPins[] = {A0, A1, A2, A3};
+const uint8_t WIDTH = 4;
 
 // My node ID: 0x02
 SWP2P node(0x02);
