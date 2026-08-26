@@ -1,5 +1,4 @@
 #include "SWP2P.h"
-
 static_assert((SWP2P_FIFO_DEPTH & (SWP2P_FIFO_DEPTH - 1)) == 0, "SWP2P_FIFO_DEPTH must be a power of 2");
 
 uint8_t SWP2PBase::_nodeId = 0;
@@ -11,6 +10,9 @@ volatile uint8_t SWP2PBase::_rxCount = 0;
 volatile uint8_t SWP2PBase::_txState = 0;
 uint8_t SWP2PBase::_txDestId = 0;
 uint8_t SWP2PBase::_txData = 0;
+uint8_t SWP2PBase::_txBuffer[SWP2P_MAX_BURST];
+uint8_t SWP2PBase::_txLen = 0;
+uint8_t SWP2PBase::_txIdx = 0;
 volatile uint16_t SWP2PBase::_txArbReg = 0;
 volatile uint8_t SWP2PBase::_txDataReg = 0;
 volatile uint8_t SWP2PBase::_arbChunkCount = 0;
@@ -22,6 +24,8 @@ volatile uint8_t SWP2PBase::_rxAddrByte = 0;
 volatile uint8_t SWP2PBase::_rxSrcByte = 0;
 volatile uint8_t SWP2PBase::_rxDataByte = 0;
 volatile uint8_t SWP2PBase::_rxChunkCount = 0;
+volatile uint8_t SWP2PBase::_rxLen = 0;
+volatile uint8_t SWP2PBase::_rxByteIdx = 0;
 
 void (*SWP2PBase::_isrClkCallback)() = nullptr;
 void (*SWP2PBase::_isrBusyCallback)() = nullptr;
@@ -42,17 +46,14 @@ void SWP2PBase::setupTimer1(unsigned long freq) {
     TCCR1A |= (1 << COM1A0);
     TCCR1B |= (1 << WGM12) | (1 << CS10);
 }
-
 void SWP2PBase::stopTimer1() { TCCR1B = 0; }
 
 ISR(INT0_vect) {
     if (SWP2PBase::_isrClkCallback) SWP2PBase::_isrClkCallback();
 }
-
 ISR(INT1_vect) {
     if (SWP2PBase::_isrBusyCallback) SWP2PBase::_isrBusyCallback();
 }
-
 ISR(PCINT0_vect) {
-    // Ack edge handler
+    // Ack edge handler (현재 미사용 - 원본과 동일하게 비워둠)
 }
