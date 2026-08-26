@@ -8,7 +8,7 @@
 
 const DataPreset PRESET = PRESET_W4_D4_D7;
 
-SWP2P<PRESET> node(0x02);
+SWP2P<PRESET> node(0x02);   // node ID: 0x02
 
 void setup() {
 
