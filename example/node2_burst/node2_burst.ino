@@ -1,59 +1,32 @@
-/*
- * -------------------------------------------------------------------------------------------------
- * node2_digital_read_burst_rx.ino - Fixed Burst Frame Sync Rx (Node 0x02)
- * -------------------------------------------------------------------------------------------------
- */
+#include <Arduino.h>
+#include "SWP2P.h"
+#include "SWP2PBuffer.h"
 
-#include <SWP2P.h>
-
-const DataPreset PRESET = PRESET_W4_D4_D7;
-SWP2P<PRESET> node(0x02); // Slave Node ID: 0x02
+// 4비트 데이터선 규격(D4~D7) 및 Node ID 0x02 설정
+SWP2P<PRESET_W4_D4_D7> node(0x02);
 
 void setup() {
     Serial.begin(115200);
-    while (!Serial);
 
-    node.begin(false); // Slave: External CLK (INT0)
-    Serial.println(F("=== SWP2P Node 0x02 (Digital Read Stream Rx) Initialized ==="));
+    // CLK Slave 노드로 시작
+    node.begin(false);
+
+    Serial.println(F("[Node 2] SWP2P 4-Bit Burst Receiver Initialized (D4~D7)"));
 }
 
 void loop() {
-    // 1. 수신 FIFO 버퍼에 최소 1바이트 이상 들어오면 감지
+    // 수신 FIFO에 데이터가 들어왔는지 확인
     if (node.available()) {
-        // [중요] 버스트 프레임의 모든 바이트가 ISR을 통해 FIFO에 완전히 들어올 때까지 미세 대기
-        // (100kHz 버스 클럭 기준 4바이트 수신에 약 200~300us 소요됨)
-        delayMicroseconds(500);
+        Serial.print(F("[RX Data Received] -> Hex: "));
 
-        uint8_t rxBuffer[SWP2P_MAX_BURST];
+        // FIFO에 쌓인 모든 데이터 읽기
+        while (node.available()) {
+            uint8_t rxByte = node.read();
 
-        // FIFO 버퍼에 쌓인 전체 패킷 바이트를 한 번에 흡수
-        uint8_t receivedLen = node.readBytes(rxBuffer, SWP2P_MAX_BURST);
-
-        Serial.print(F("[RX Burst] Received "));
-        Serial.print(receivedLen);
-        Serial.println(F(" Bytes:"));
-
-        // 2. 수신받은 바이트 데이터 HEX 출력
-        Serial.print(F("  -> Raw Data (HEX): "));
-        for (uint8_t i = 0; i < receivedLen; i++) {
-            Serial.print(F("0x"));
-            if (rxBuffer[i] < 0x10) Serial.print(F("0"));
-            Serial.print(rxBuffer[i], HEX);
+            if (rxByte < 0x10) Serial.print(F("0"));
+            Serial.print(rxByte, HEX);
             Serial.print(F(" "));
         }
         Serial.println();
-
-        // 3. 패킹되어 들어온 8비트 데이터를 1비트 단위로 언패킹 출력
-        Serial.print(F("  -> Stream Bit Value: "));
-        for (uint8_t i = 0; i < receivedLen; i++) {
-            uint8_t currentByte = rxBuffer[i];
-
-            for (int8_t bitIdx = 7; bitIdx >= 0; bitIdx--) {
-                uint8_t bitVal = (currentByte >> bitIdx) & 0x01;
-                Serial.print(bitVal);
-            }
-            Serial.print(F(" "));
-        }
-        Serial.println(F("\n--------------------------------------------------"));
     }
 }

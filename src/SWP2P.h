@@ -4,9 +4,10 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/atomic.h>
+#include "SWP2PBuffer.h"
 
-#define SWP2P_FIFO_DEPTH 4
-#define SWP2P_MAX_BURST  16   // _txBuffer 크기. len-2를 8비트 레지스터에 실어 보내므로 이론상 257까지 가능하지만
+#define SWP2P_FIFO_DEPTH 16
+#define SWP2P_MAX_BURST   16   // _txBuffer 크기. len-2를 8비트 레지스터에 실어 보내므로 이론상 257까지 가능하지만
                               // RAM 절약 위해 우선 16으로 제한 (필요시 늘리면 됨)
 
 // ---- 주소 인코딩 ----
@@ -146,6 +147,42 @@ public:
         _txState = 1; // TX_PENDING
         SET_FLAG(FLAG_IS_SENDING);
         return true;
+    }
+
+    // ---- 사용자 친화 buffer API ----
+    // 비트를 하나씩 밀어넣어 buffer를 자동으로 채운다. (SWP2PBuffer.h의 SWP2PBuffer<CAP> 사용)
+    template <uint8_t CAP>
+    bool buff(SWP2PBuffer<CAP>& buf, bool bit) {
+        return buf.pushBit(bit);
+    }
+    // 바이트 단위로 밀어넣고 싶을 때
+    template <uint8_t CAP>
+    bool buff(SWP2PBuffer<CAP>& buf, uint8_t byteVal, bool /*asByte*/) {
+        return buf.pushByte(byteVal);
+    }
+
+    template <uint8_t CAP>
+    void buffFree(SWP2PBuffer<CAP>& buf) { buf.clearAll(); }
+    template <uint8_t CAP>
+    void buffFree(SWP2PBuffer<CAP>& buf, uint8_t idx) { buf.clearBuffer(idx); }
+
+    // buffer 전체(len()만큼) 전송
+    template <uint8_t CAP>
+    bool sendBurst(uint8_t destId, SWP2PBuffer<CAP>& buf) {
+        // CAP이 SWP2P_MAX_BURST보다 큰 buffer 타입 자체를 설계 단계에서 컴파일 에러로 잡는다.
+        // (런타임에는 아래 sendBurst(uint8_t*, uint8_t)의 len 체크가 이미 막아주지만,
+        //  애초에 이런 buffer를 만드는 실수를 조기에 알려주기 위함)
+        static_assert(CAP <= SWP2P_MAX_BURST,
+            "SWP2PBuffer CAP exceeds SWP2P_MAX_BURST - reduce CAP or increase SWP2P_MAX_BURST");
+        return sendBurst(destId, buf.data, buf.len());
+    }
+    // buffer의 offset부터 len개만 잘라서 전송 (범위 벗어나면 false)
+    template <uint8_t CAP>
+    bool sendBurst(uint8_t destId, SWP2PBuffer<CAP>& buf, uint8_t offset, uint8_t len) {
+        static_assert(CAP <= SWP2P_MAX_BURST,
+            "SWP2PBuffer CAP exceeds SWP2P_MAX_BURST - reduce CAP or increase SWP2P_MAX_BURST");
+        if ((uint16_t)offset + len > buf.len()) return false;
+        return sendBurst(destId, buf.data + offset, len);
     }
 
     bool available() { return _rxCount > 0; }
