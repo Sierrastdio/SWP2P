@@ -1,121 +1,326 @@
-# SWP2P 통신 버스 프로토콜 설계 스펙 (v2)
+# SWP2P (Software Peer-to-Peer)
 
-## 프로젝트 목적
-SPI/I2C/CAN처럼 "슬레이브-마스터-슬레이브"를 거쳐야 하는 오버헤드 없이, 노드 간 **직접 통신**이 가능하면서도 하드웨어 UART 시리얼통신보다 빠른 경량 버스 프로토콜을 Verilog(SystemVerilog)로 설계하고, 최종적으로 아두이노(AVR) 라이브러리로 이식한다.
+A masterless peer-to-peer communication library for AVR (Arduino) nodes.
+Unlike SPI/I2C/CAN, where slave-to-slave traffic has to be relayed through a master,
+SWP2P lets nodes talk to each other directly, without any node acting as a bus master.
 
-> **v2 변경 요지**: 실물(Arduino Uno 2대) 검증 단계에서 핀 배정 정정, TX 시작 타이밍 동기화 버그 수정, 내부 풀업 제거, ISR 최적화를 반영. 성능 목표는 **확장성(버스 안정성) 우선, 속도는 차순위**로 우선순위를 재조정. 클럭 상한 실측치와 목표 미달 격차를 명시.
+## Features
 
-## 설계 철학 (핵심 원칙)
-1. **가변 데이터선(WIDTH)**: 라이브러리 사용자가 코드 작성 단계에서 데이터선 개수를 1~8 사이로 설정할 수 있어야 한다. 핀 수와 속도의 트레이드오프를 사용자가 직접 선택.
-2. **완전한 마스터리스 구조**: CLK은 노드 중 하나가 출력하거나 외부 클럭을 사용할 수 있지만, 클럭을 출력하는 노드가 "마스터" 역할(중재자, 조정자)을 갖지 않는다. 모든 노드는 대등(peer-to-peer)하다. **(구현 확인됨: 라이브러리 클래스 레벨에 마스터/슬레이브 구분이 없고, `clkIsOutput` 파라미터는 순수 배선 역할일 뿐 프로토콜상 권한과 무관함을 실제 테스트로 검증 — 송신측 스케치를 수신 노드에 그대로 꽂아도 동일하게 동작함.)**
-3. **최소 라인 구성**: BUSY_N, ACK_N, DATA_BUS(WIDTH비트) 만으로 구성. 아두이노 10개 노드를 매달아도 문제없이 동작해야 한다.
-4. **확장성 최우선, 속도는 차순위 (v2 변경)**: 원래 "저지연(5~10배)"을 1순위로 뒀으나, 실물 검증 결과 노드 수 확장 시 안정성(전기적 마진)이 속도보다 훨씬 깨지기 쉬운 것으로 확인됨. **이후 개발은 버스 신뢰성/확장성을 1순위, 속도 개선은 2순위로 진행한다.**
-5. **전기적 특성**: BUSY_N, ACK_N, DATA_BUS 전 라인 open-drain(wired-AND) + 외부 pull-up. **내부 풀업(`INPUT_PULLUP`)은 사용하지 않는다** — 노드 수가 늘어날수록 각 노드의 내부 풀업(~20~50kΩ)이 전부 병렬로 걸려 유효 저항이 외부 저항값과 무관하게 예측 불가능해지는 문제가 확인되어, 순수 `INPUT`(플로팅) + 외부 풀업 저항 하나로만 버스 RC 특성을 결정하도록 통일함.
+- **Masterless architecture**: One node may drive the CLK line, but that node does not act as a bus master. All nodes participate in send/receive as equals.
+- **Configurable data width**: Choose 1/2/4/8 data lines (`DataPreset`). More lines means more bits per clock edge and higher throughput.
+- **CLK/BUSY_N/ACK_N based protocol**: Only a minimal set of control lines (BUSY_N, ACK_N) is needed, supporting roughly 10 nodes on the bus by design.
+- **Bit-level arbitration**: The 2-byte destination + source address is driven open-drain and read back on the falling edge for comparison; on a collision the losing node yields automatically (TX_LOST → auto-retry).
+- **Single-byte and burst transfers**: `send()` uses the original fast path (no LEN field); `sendBurst()` adds a LEN field to transfer multiple bytes in one frame.
+- **Interrupt-driven, non-blocking**: Uses INT0 (CLK), INT1 (BUSY_N), PCINT0 (ACK_N), and Timer1 (automatic CLK output) to minimize CPU overhead.
+- **RX FIFO + user-friendly buffer API**: `SWP2PBuffer<CAP>` lets you accumulate data bit-by-bit or byte-by-byte, then send it whole or as a sub-range.
 
-## 참고 모델과의 관계
-- 개념적으로 **CAN 버스의 비트단위 우선순위 중재(wired-AND arbitration)** 를 차용한다. "마스터 없는 대등 통신"이라는 아이디어 자체는 CAN과 동일 계열이며, 이 프로토콜이 CAN보다 가벼운 이유는 CAN의 11~29비트 ID, CRC, 여러 필드 등 무거운 프레임 구조를 걷어내고 8비트 주소 + 최소 필드로 극단적으로 경량화했기 때문이다.
-- I2C/SPI와 달리 브로드캐스트 및 슬레이브 간 임의 통신이 프로토콜 레벨에서 기본 지원되어야 한다.
+## Hardware Layout
 
-## 라인 정의 (v2: 실제 구현 기준으로 정정)
+| Signal | Pin (default) | Description |
+|---|---|---|
+| CLK | D2 (INT0) | Communication clock. Driven by one node (not a master) or an external clock source |
+| BUSY_N | D3 (INT1) | Bus-busy indicator |
+| ACK_N | D8 (PCINT0) | Receive acknowledgment |
+| Data line(s) | D4–D7 / D9,D10 / A0–A3, etc., depending on preset | Selected via `DataPreset` |
 
-| 라인 | 핀 | 인터럽트 | 특성 |
-|---|---|---|---|
-| CLK | D2 (input) / D9 (output, Timer1 OC1A) | INT0 | 공유 클럭. CLK을 출력하는 노드는 D9→D2 점퍼선으로 자기 자신에게도 루프백 필요. posedge=Tx 스텝, negedge=Rx 스텝. |
-| BUSY_N | D3 | INT1 | 양방향, open-drain. 버스 점유(프레임 진행 중) 표시. Idle=1(release), 점유 중=0. |
-| ACK_N | D8 | **PCINT0** | 양방향, open-drain. 수신 확인, 정확히 1클럭 폭의 LOW 펄스. |
-| DATA_BUS[WIDTH-1:0] | 사용자 지정(예: D4~D7) | — | 양방향, open-drain, WIDTH=1~8 (사용자 설정) | 주소/데이터 운반 |
+Data lines are always driven open-drain (pull-up resistors required). For each `DataPreset`, `_driveDataChunk` / `_readDataChunk` / `_dataRelease` are specialized at compile time (`if constexpr`) and fully inlined.
 
-> **⚠️ v1과의 차이 (중요)**: v1 스펙 문서는 "BUSY_N, ACK_N을 각각 INT0, INT1에 배치"하고 "PCINT는 오버헤드 때문에 지양"한다고 명시했었으나, **실제 구현은 CLK=INT0, BUSY_N=INT1, ACK_N=PCINT0으로 배정되어 있다.** CLK이 매 엣지(posedge/negedge)마다 Tx/Rx 스텝 진행의 핵심 트리거 역할을 하기 때문에 하드웨어 엣지 지정이 가능한 INT0 슬롯이 BUSY_N보다 CLK에 더 필요하다고 판단해 이렇게 배정되었다. ACK_N은 상대적으로 지연 허용치가 크다고 보고 PCINT0(D8)으로 밀려났다. **이 문서를 최신 기준으로 삼는다.**
+## Installation
 
-## 프레임 구조
+Copy `SWP2P.h`, `SWP2P.cpp`, and `SWP2PBuffer.h` into a `libraries/SWP2P/` folder in your sketchbook, then `#include "SWP2P.h"` from the Arduino IDE (or arduino-cli).
+
+## Quick Start
+
+```cpp
+#include "SWP2P.h"
+
+// Node using 1 data line (D4), node ID = 1
+SWP2P<PRESET_W1_D4> node(1);
+
+void setup() {
+    // Whether this node drives CLK, and the clock frequency (Hz)
+    node.begin(true, 1000UL);
+}
+
+void loop() {
+    // Send 1 byte to node 2
+    node.send(2, 0x42);
+
+    // Check for received data
+    if (node.available()) {
+        uint8_t v = node.read();
+        // ...
+    }
+}
 ```
-[Idle 감지: BUSY_N==1]
-  → [Pending: send() 호출 시점]
-      · 실제 BUSY_N 하강과 첫 주소 청크 구동은 즉시 실행되지 않고,
-        "다음 CLK posedge"까지 대기(TX_PENDING 상태)
-      · main loop(비동기 컨텍스트)에서 곧바로 busy_out을 내리면 CLK 위상과
-        무관한 임의 시점에 프레임이 시작되어, 수신측이 몇 번째 청크가
-        첫 청크인지 오판하는 레이스 컨디션이 발생함이 실물 테스트로 확인됨
-        (→ 아래 "알려진 이슈 및 수정 이력" 참고)
-  → [중재(Arbitration) 단계: ceil(8/WIDTH) 클럭]
-      · BUSY_N 하강 + 첫 주소 청크 구동이 같은 CLK posedge에서 동시에 실행됨
-      · 송신 예정 노드들이 자신의 NODE_ID를 MSB부터 WIDTH비트씩 동시에 구동
-      · open-drain 특성상 0을 미는 노드가 항상 우선(dominant bit)
-      · 자신이 1(release)로 보낸 비트인데 버스 값이 0으로 읽히면 즉시 패배 → busy_out<=1, 송신 포기(재시도는 TX_PENDING으로 복귀 후 다음 posedge에 재동기화)
-      · 되읽기 검증은 구동한 같은 엣지가 아닌 반클럭 뒤(negedge)에서 수행 — 풀업 RC 정착시간을 확보하기 위함
-      · 마지막 청크까지 살아남은 노드가 유일한 송신자로 확정
-  → [데이터 단계: ceil(8/WIDTH) 클럭]
-      · 확정된 송신자가 실제 데이터 바이트를 WIDTH비트씩 구동
-  → [Release: 1클럭] (data_out을 idle값으로 복귀, posedge)
-  → [ACK 단계: 1클럭]
-      · 수신자(주소가 일치하는 노드, 혹은 브로드캐스트 시 전체)가 negedge에서 ACK_N을 LOW로 구동 시작
-  → [BUSY_N 복귀: 1클럭] (다음 posedge에서 busy_release, 능동적으로 트리거됨)
-  → [ACK_N 복귀: 비동기] (CLK 엣지와 무관, BUSY_N이 물리적으로 HIGH로 올라온 것을 각 노드가 INT1로 감지한 시점에 개별적으로 ack_release. 송신·수신 노드 전부 이 시점에 반응함)
+
+## API
+
+### Node creation / initialization
+
+```cpp
+SWP2P<DataPreset> node(uint8_t nodeId);
+void node.begin(bool clkIsOutput, unsigned long clkFreq = 100000UL);
 ```
 
-## 핵심 로직 요구사항
-1. **WIDTH 파라미터화**: `ARB_CYCLES = ceil(8/WIDTH)`를 자동 계산. WIDTH=8이면 중재 1클럭(완전 병렬), WIDTH=1이면 8클럭(완전 직렬)로 자연스럽게 양극단을 커버해야 한다. **(구현: ISR 핫패스에서 매 엣지 재계산하지 않도록 `begin()` 시점에 캐싱함 — AVR은 하드웨어 나눗셈기가 없어 `/` 연산이 느림.)**
-2. **0xFF sentinel 문제 해결**: 데이터 유효성 판단에 `data_bus != 0xFF` 같은 매직값 비교를 쓰지 않는다. 대신 "이 프레임에서 아직 캡처하지 않음" 상태 플래그(`captured_this_frame`)로 유효성을 판단해, 실제 페이로드가 0xFF/0x00 등 임의값이어도 정상 전송되어야 한다.
-3. **이중 캡처 방지**: BUSY_N이 재차 풀릴 때까지 동일 프레임에서 같은 바이트를 두 번 FIFO에 넣지 않도록 프레임 단위 캡처 플래그로 원천 차단한다.
-4. **NODE_ID 기반 주소 지정**: 프레임 첫 필드(중재에 사용된 값 자체)가 목적지 주소 역할을 겸한다. 수신 노드는 자신의 NODE_ID와 일치하거나 브로드캐스트 값(예: 8'hFF)일 때만 데이터를 FIFO에 저장하고 ACK를 건다.
-5. **동시 송신 충돌 방지**: 중재 단계에서 패배한 노드는 즉시 버스를 양보(`busy_out<=1`)하고, 승리한 노드만 데이터 단계로 진입한다. 데이터 페이즈에서는 유일한 구동자만 남아있으므로 버스 컨텐션이 구조적으로 발생하지 않는다.
-6. **NODE_ID 유일성**: 마스터가 없어 런타임 검증 수단이 없으므로, 컴파일 타임(파라미터)에서 사용자가 직접 유일한 ID를 부여하도록 강제. (선택 확장: 부팅 시 중재를 이용한 자동 ID 할당 — 미구현)
-7. **Rx FIFO**: 노드당 최소 depth 4의 하드웨어 FIFO로 수신 데이터를 버퍼링, CPU(또는 상위 로직)가 비동기로 읽어간다. **depth는 반드시 2의 거듭제곱이어야 함(컴파일 타임 static_assert로 강제) — FIFO 인덱스 연산을 `%` 대신 `&`(비트마스크)로 처리해 ISR 오버헤드를 줄이기 위함.**
-8. **TX 시작 시점의 CLK 동기화 (v2 신규 항목)**: `send()` 호출은 즉시 버스를 점유하지 않고 `TX_PENDING` 상태만 세팅한다. 실제 `BUSY_N` 하강과 중재 첫 청크 구동은 반드시 **다음 CLK posedge에서 동시에** 이루어져야 한다. (근거: 알려진 이슈 및 수정 이력 참고)
+- `nodeId` is masked to 7 bits (0–126). `0x7F` (127) is reserved as the broadcast address.
+- If `clkIsOutput = true`, this node automatically drives CLK using Timer1.
 
-## 알려진 이슈 및 수정 이력
-- **[수정됨] TX 시작 레이스 컨디션**: `send()`에서 `main loop` 컨텍스트 즉시 `busy_out`을 내리면, CLK이 자유토글(free-running) 중일 때 BUSY_N 하강 시점과 CLK 위상이 어긋나 수신측이 프레임 청크 정렬을 한 칸씩 밀려서 읽는 문제가 실물 테스트로 확인됨. `TX_PENDING` 중간 상태를 도입해 CLK posedge와 동기화하여 해결.
-- **[수정됨] 위 수정의 2차 버그**: 초기 패치 시 `TX_PENDING` 블록에서 첫 청크 구동 직후 청크 인덱스를 즉시 감소시켜, negedge에서 한 번 더 감소되며 이중으로 줄어드는 문제 발생 → 중재 청크 1개를 덜 구동한 채 데이터 단계로 조기 진입 → 수신측이 프레임 전체를 못 읽고 완전히 침묵하는 증상으로 나타남. 감소 로직을 negedge 단일 지점으로 통일해 수정.
-- **[확인됨, 미수정] 자기 오탐 가능성**: BUSY_N 복귀 시 라인 바운스/링잉이 발생하면, 이미 idle로 전환된 노드가 이를 "새 프레임 시작"으로 오인해 아무도 구동하지 않는 데이터선을 전부 1로 읽어 `0xFF`(브로드캐스트 주소)로 오판, FIFO에 쓰레기 값이 들어가는 경우가 실물 테스트에서 드물게(약 10회 중 1회) 관측됨. 외부 풀업 도입 및 내부 풀업 제거로 빈도는 감소했으나 완전히 제거되지는 않음. 근본 해결책(슈미트 트리거 버퍼, 소프트웨어 디바운스 가드)은 v3 과제로 이월.
+### Sending
 
-## 성능 목표 (v2: 실측 반영 및 우선순위 하향 조정)
-- 기준 비교 대상: 아두이노 하드웨어 UART, 115200bps(바이트당 ≈86.8us) 및 1Mbps(≈10us)
-- 아두이노 구현 시 `digitalWrite()` 대신 **포트 레지스터 직접 제어(PORTB/PORTD 등)** 사용 — **구현 완료** (핀별 DDR/PORT/PIN 레지스터를 `begin()`에서 캐싱, ISR은 포인터 역참조만 수행)
-- **원래 목표 (v1)**: WIDTH=1 구성만으로도 UART 115200bps 대비 약 10배 이상 빠른 프레임 전송시간 목표 (18클럭 내외). WIDTH≥4 구성에서는 UART 1Mbps보다 빠른 것이 목표.
-- **실측 결과 (2대 Uno, 브레드보드 배선 기준)**:
+```cpp
+bool node.send(uint8_t destId, uint8_t data);
+bool node.sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len);
+```
 
-| 조건 | CLK 상한 | WIDTH=8 바이트당 시간 | WIDTH=4 바이트당 시간 | UART 115200 대비 (WIDTH=8) |
-|---|---|---|---|---|
-| 외부 풀업 없음(내부 풀업만), 송신 노드 단독 측정 | ≈76kHz | ≈52.6us | ≈78.9us | 약 1.65배 빠름 |
-| 외부 풀업 4.7kΩ, 수신 노드 포함 실동작 기준 | ≈26kHz | ≈153.8us | ≈230.8us | 약 1.8배 **느림** |
-| 외부 풀업 4.7kΩ + 내부 풀업 제거 후 | ≈70kHz | ≈57.1us | ≈85.7us | 약 1.5배 빠름 |
+- `send()` is the single-byte fast path (no LEN field).
+- `sendBurst()` automatically sets the burst flag (MSB of the destination byte) when `len > 1`, and transmits an additional LEN field (encoded as `len - 2`). `len` must be between 1 and `SWP2P_MAX_BURST` (default 16, can be increased if needed).
+- Returns `false` if a transfer is already in progress (`isSending()`) or the bus is busy (`isBusy()`).
+- Use `SWP2P<PRESET>::BROADCAST` as `destId` to broadcast to all nodes.
 
-- **목표 대비 격차**: WIDTH=8 기준 UART 115200 대비 10배(바이트당 8.68us)를 달성하려면 CLK 약 **460kHz**가 필요. 현재 실측 최대치(≈70kHz) 대비 **약 6.6배** 추가 상승이 필요한 상태이며, 이는 로직/코드 최적화가 아니라 전기적 마진(RC 정착시간, 배선 전파지연, 인터럽트 레이턴시) 문제로 진단됨.
-- **우선순위 조정 (v2)**: 위 격차를 메우는 하드웨어적 개선(슈미트 트리거 버퍼, 저항값 추가 하향, 버스 세그멘테이션)은 확장성 검증 이후로 순서를 미룬다. **현재는 "노드 수가 늘어도 안정적으로 동작하는가"를 먼저 검증하고, 그 다음에 그 안정성을 유지하며 속도를 올리는 순서로 진행한다.**
+### Receiving
 
-## 전기적 특성 및 확장성 관련 실측 지식 (v2 신규)
-- **송신측과 수신측의 클럭 상한 비대칭**: 동일 풀업 조건에서 CLK을 생성/구동하는 노드(송신측)가 그 신호를 수동으로 읽어야 하는 노드(수신측)보다 훨씬 높은 클럭에서도 안정적으로 동작함이 확인됨 (예: 76kHz vs 26kHz). open-drain 버스에서 "0으로 끌어내리는 것"은 능동적이라 빠르지만 "1로 복귀하는 것"은 풀업 RC 충전에 의존하는 수동 과정이라 근본적으로 느리며, 프로토콜상 수신 노드는 이 "1로 복귀하는 신호"를 읽어야 하는 구간이 송신 노드보다 훨씬 많기 때문으로 추정. 추가로 배선 전파지연(마스터→슬레이브 물리적 거리)도 기여 요인으로 추정됨.
-- **내부 풀업 병렬 문제**: 노드가 N개 붙으면 각 노드의 내부 풀업(비활성 상태에서도 병렬로 걸림)이 합쳐져 유효 저항이 외부 저항과 무관하게 낮아짐 → 외부 저항값을 정확히 튜닝해도 노드 수에 따라 실제 RC 특성이 달라지는 문제. **전 노드 내부 풀업 비활성화로 해결, 이제 외부 저항 하나만 버스 RC를 결정.**
-- **저항값 하한의 안전 근거**: 이 프로토콜은 중재 메커니즘상 항상 정확히 1개 노드만 LOW를 구동하도록 보장되므로(동시에 여러 노드가 같은 라인을 LOW로 미는 상황이 구조적으로 없음), 저항값을 낮출 때 고려할 전류 한계는 "AVR 핀 1개가 견디는 한도(권장 ~20mA)"만 보면 되고 **노드 수와 무관하게 동일한 안전 마진이 유지됨**. 이는 확장성과 완전히 양립하는 성질로, 저항값을 1kΩ 근처까지 안전하게 낮춰볼 수 있는 근거가 됨.
-- **확장성 우선 개선 후보 (검토 완료, 미착수)**:
-  - **슈미트 트리거 버퍼(74HC14 / 74HC17)**: 노이즈 마진 개선. 노드 수 증가와 무관하게 성능 유지되는 방향이라 확장성과 부합. 프로토콜/코드 변경 불필요.
-  - **74HC125(3-state 버퍼, 보유 중)**: 슈미트 트리거 기능은 없어 노이즈 마진 개선 효과는 없음. 대신 노드별 부하 격리 용도로 활용 가능 — 단, wired-AND 특성을 유지하려면 "LOW만 능동 구동, HIGH는 완전히 Hi-Z로 두어 풀업에 위임"하는 방식으로만 배선해야 함 (HIGH를 능동으로 밀면 push-pull 충돌 위험).
-  - **버스 세그멘테이션/리피터**: 노드 수가 크게 늘어날 경우(수십 개 단위) 세그먼트별로 커패시턴스를 격리해 노드 수 증가에도 속도 저하 없이 확장 가능. 현 규모(10개 목표)에서는 우선순위 낮음, 장기 과제.
-  - **(기각) 능동 가속 펄스(active speed-up pulse)**: release 순간에 짧게 push-pull로 HIGH를 밀어 RC를 우회하는 기법. 확장성을 1순위로 재조정한 v2 방침상 **채택하지 않기로 결정** — 노드 수가 늘어날수록 다른 노드와의 순간적 전기 충돌 위험이 커져 확장성과 상충되기 때문.
+```cpp
+bool node.available();
+uint8_t node.read();
+uint8_t node.readBytes(uint8_t* outBuf, uint8_t maxLen);
+uint8_t node.peek();
+void node.flush();
+```
 
-## 테스트벤치 요구사항 (Verilog 시뮬레이션, 미착수)
-- 최소 10개 `bus_node` 인스턴스 동시 연결
-- 시나리오: (a) 단일 노드 단독 송신, (b) 2개 이상 노드 동시 송신 시도 시 중재 정상 동작, (c) 브로드캐스트, (d) 특정 목적지 주소 송신 시 비목적지 노드의 무시 동작, (e) FIFO full 상태에서의 동작
-- `$dumpvars`로 파형 검증(BUSY_N, ACK_N, DATA_BUS, 각 노드의 tx_state/rx_state)
+Received data is queued in an internal FIFO (`SWP2P_FIFO_DEPTH`, default 16, must be a power of 2). Only packets addressed to this node (or broadcast packets) are captured into the FIFO.
 
-## 아두이노(AVR) 이식 시 CPU 부담 최소화 원칙
-1. **CLK 생성 — Timer/Counter CTC 모드 + OC 핀 하드웨어 자동 토글**: **구현 완료.** Timer1을 CTC 모드로 설정해 D9(OC1A)가 하드웨어적으로 자동 토글되도록 함. CPU는 `begin()`에서 초기 레지스터 설정 1회만 수행.
-2. **BUSY_N/ACK_N 엣지 감지 — External Interrupt 우선 사용**: **부분 구현.** CLK(D2)=INT0, BUSY_N(D3)=INT1까지는 원칙대로 하드웨어 엣지 지정 인터럽트를 사용하나, ACK_N(D8)은 PCINT0으로 배정되어 원래 "PCINT 지양" 원칙과는 다르게 구현됨 (배정 사유는 "라인 정의" 섹션 참고).
-3. **정밀 타이밍이 필요한 이벤트 — Input Capture Unit(ICU, Timer1) 활용**: 미구현. 현재는 INT0/INT1/PCINT0 엣지 인터럽트만으로 중재/ACK 타이밍을 처리 중. 추후 타이밍 마진이 부족해지면 도입 검토.
-4. **제외 대상: 하드웨어 SPI 시프트레지스터**: 기각 유지.
-5. **Rx FIFO는 ISR 내에서 최소 작업만 수행**: **구현 완료.** ISR은 `_fifoPush()`만 수행하고, FIFO depth를 2의 거듭제곱으로 강제해 인덱스 연산을 비트마스크로 처리, `available()`/`read()`는 메인 루프에서 비동기 소비.
+### Status checks
 
-## 다음 단계 (우선순위순)
-1. 노드 3개 이상으로 확장 테스트 (중재 충돌 시나리오 실물 검증 — 현재까지는 2노드 단방향만 검증됨)
-2. 슈미트 트리거 버퍼(74HC14/74HC17) 도입으로 BUSY_N 복귀 시 오탐(`0xFF` 글리치) 근본 해결
-3. 안정성 확보 후 저항값/버퍼 조합으로 속도 재측정 및 목표(UART 대비 5~10배) 재도전
-4. Verilog 테스트벤치 작성 착수 (현재까지 AVR 실물 구현이 스펙보다 앞서 진행됨 — RTL은 미착수 상태)
+```cpp
+bool node.isSending();
+bool node.isBusy();
+```
 
--> 그러나! 풀업 저항을 1K~4.7K 까지 사용해봤는데 최대 클럭수에는 큰 변화가 없었음. 클럭수가 많이 안오르면 저항 탓을 할게 아니라 코드탓을 해야함.
+### Buffer API (`SWP2PBuffer<CAP>`)
 
--> data Width 을 미리 정해놓는것도 좋을듯. 데이터 선을 같은 PORT에 정의 하면 한번에 입출력에 유리해짐.
-사용가능핀:
-1. Width = 1 (1비트): D4, D5, D6, D7 (PORTD)/D9, D10, D11, D12, D13 (PORTB)/A0, A1, A2, A3, A4, A5 (PORTC)
-2. Width = 2 (2비트): [D4, D5] 또는 [D6, D7] (PORTD)/[D9, D10] 또는 [D10, D11] 또는 [D11, D12] (PORTB)/[A0, A1] 또는 [A1, A2] 또는 [A2, A3] 또는 [A4, A5] (PORTC)
-3. Width = 4 (4비트): [D4, D5, D6, D7] (PORTD) $\rightarrow$ [가장 추천] ISR 진입 시 포트 전환 없이 최고 속도/[D9, D10, D11, D12] (PORTB)/[A0, A1, A2, A3] (PORTC)
-4. Width = 8 (8비트): [A0, A1, A2, A3, D4, D5, D6, D7]상위 4비트: PORTC (A0~A3), 하위 4비트: PORTD (D4~D7)
+Use this to accumulate multiple bytes bit-by-bit or byte-by-byte before sending them together as a burst.
+
+```cpp
+SWP2PBuffer<16> buf;
+
+// Push one bit at a time (a byte is completed every 8 bits)
+node.buff(buf, digitalRead(10));
+
+// Push a whole byte at once
+node.buff(buf, someByte, true);
+
+// Send the entire buffer (buf.len() bytes)
+node.sendBurst(destId, buf);
+
+// Send only 8 bytes starting at buf[4]
+node.sendBurst(destId, buf, 4, 8);
+
+// Clear the entire buffer
+node.buffFree(buf);
+
+// Clear only buf[2] (count stays the same, later data is not shifted)
+node.buffFree(buf, 2);
+```
+
+- `CAP` in `SWP2PBuffer<CAP>` is a compile-time constant; a compile error is raised if `CAP > SWP2P_MAX_BURST`.
+- `buffFree(buf, idx)` does not delete the element — it overwrites that position with 0. It does not affect `count` (the buffer length), so a subsequent `sendBurst(dest, buf)` call will still transmit the 0x00 at that position as if it were real data.
+
+### `DataPreset` (data line configuration)
+
+| Preset | Data line(s) | Width |
+|---|---|---|
+| `PRESET_W1_D4`–`PRESET_W1_D10`, `PRESET_W1_A0` | 1 | 1 bit |
+| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_D9_D10`, `PRESET_W2_A0_A1` | 2 | 2 bits |
+| `PRESET_W4_D4_D7`, `PRESET_W4_A0_A3`, `PRESET_W4_D9_D12` | 4 | 4 bits |
+| `PRESET_W8_A0_D7` | 8 | 8 bits |
+
+A wider data width carries more bits per clock edge, reducing the number of transfer cycles — but in practice, ISR execution time becomes the bottleneck, so the maximum achievable clock frequency can actually be lower with wider widths (measured internally: roughly 40kHz at WIDTH=1 vs. roughly 29kHz at WIDTH=8). Consider this trade-off when choosing a preset for your use case.
+
+## Protocol Overview
+
+1. **ARB (Arbitration)**: On each rising CLK edge, 2 bytes — `dest` (MSB = burst flag) and `src` — are driven open-drain, and read back on the falling edge for comparison. If the bus value indicates another node is driving a higher-priority (more "0"-heavy) value, this node immediately yields, enters the `TX_LOST` state, and automatically retries once BUSY_N returns to idle.
+2. **LEN (burst frames only)**: The value `len - 2` is encoded and transmitted (this step is skipped for single-byte transfers).
+3. **DATA**: 1 byte (single transfer) or `len` bytes (burst) are transmitted in sequence.
+4. **RELEASE/ACK**: The sender releases the data line(s) and finishes; the receiver confirms reception via ACK_N.
+
+Receiving nodes only capture packets addressed to them (or broadcast packets) into the FIFO; other packets are tracked for line-state purposes only and otherwise ignored.
+
+## Design Constraints / Notes
+
+- Data lines must be open-drain with pull-up resistors — testing confirmed that communication is impossible without pull-ups.
+- Node IDs are limited to 0–126; 127 (`SWP2P_BROADCAST`) is reserved for broadcast.
+- Increasing `SWP2P_MAX_BURST` (default 16) allows burst transfers of up to 257 bytes in theory, but increases RAM usage accordingly.
+- The maximum usable clock frequency depends on your environment (pull-up resistor values, wiring, WIDTH setting); measuring and tuning it empirically is recommended.
+
+## File Overview
+
+- `SWP2P.h` — `SWP2PBase` (shared static state) + `SWP2P<DataPreset>` template class (compile-time specialization per pin configuration)
+- `SWP2P.cpp` — static member definitions, Timer1 setup, ISR (INT0/INT1/PCINT0) bridges
+- `SWP2PBuffer.h` — user-friendly buffer template class for accumulating data bit-by-bit or byte-by-byte
+
+
+***
+
+
+
+# SWP2P (Software Peer-to-Peer)
+
+AVR(아두이노) 기반 마스터 없는 대등(peer-to-peer) 노드 간 통신 라이브러리입니다.
+SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 중계하는 오버헤드 없이,
+노드끼리 직접 통신하는 것을 목표로 합니다.
+
+## 특징
+
+- **마스터 없는 구조**: CLK을 출력하는 노드가 있을 수는 있지만, 그 노드가 버스의 주인(마스터) 역할을 하지 않습니다. 모든 노드가 대등하게 송수신에 참여합니다.
+- **가변 데이터 폭**: 데이터선을 1/2/4/8개 중에서 선택할 수 있습니다 (`DataPreset`). 선 개수가 늘어날수록 사이클당 더 많은 비트를 실어 전송 속도를 높일 수 있습니다.
+- **CLK/BUSY_N/ACK_N 3선 기반 프로토콜**: 최소한의 제어선(BUSY_N, ACK_N)만으로 다수 노드(설계 목표 약 10개) 연결을 지원합니다.
+- **비트 단위 중재(arbitration)**: 목적지 주소(dest) + 발신자 주소(src) 2바이트를 open-drain 방식으로 실어 보내고, 되읽기(readback) 비교를 통해 충돌 시 자동으로 양보(TX_LOST → 재시도)합니다.
+- **단일 바이트 / 버스트 전송 모두 지원**: `send()`는 기존 빠른 경로를 그대로 사용하고, `sendBurst()`는 길이(LEN) 필드를 추가로 실어 여러 바이트를 한 번에 전송합니다.
+- **인터럽트 기반, 논블로킹**: INT0(CLK), INT1(BUSY_N), PCINT0(ACK_N)과 Timer1(CLK 자동 출력)을 활용해 CPU 부담을 최소화합니다.
+- **수신 FIFO + 사용자 친화 버퍼 API**: `SWP2PBuffer<CAP>`로 비트/바이트 단위로 데이터를 모으고, 그대로 혹은 부분 범위만 잘라서 전송할 수 있습니다.
+
+## 하드웨어 구성
+
+| 신호 | 핀 (기본) | 설명 |
+|---|---|---|
+| CLK | D2 (INT0) | 통신 클럭. 한 노드가 출력(마스터 아님) 또는 외부 클럭 |
+| BUSY_N | D3 (INT1) | 버스 점유 여부 |
+| ACK_N | D8 (PCINT0) | 수신 확인 |
+| 데이터선 | Preset에 따라 D4~D7 / D9,D10 / A0~A3 등 | `DataPreset`으로 선택 |
+
+데이터선은 항상 open-drain(풀업 필요)으로 구동되며, 각 `DataPreset`에 맞춰 컴파일타임에 `_driveDataChunk` / `_readDataChunk` / `_dataRelease`가 특수화(`if constexpr`)되어 인라인 전개됩니다.
+
+## 설치
+
+`SWP2P.h`, `SWP2P.cpp`, `SWP2PBuffer.h` 세 파일을 스케치북의 `libraries/SWP2P/` 폴더에 넣고 아두이노 IDE(또는 arduino-cli)에서 `#include "SWP2P.h"`로 사용합니다.
+
+## 빠른 시작
+
+```cpp
+#include "SWP2P.h"
+
+// 데이터선 1개(D4)를 사용하는 노드, 노드 ID = 1
+SWP2P<PRESET_W1_D4> node(1);
+
+void setup() {
+    // 이 노드가 CLK을 출력할지 여부, 클럭 주파수(Hz)
+    node.begin(true, 1000UL);
+}
+
+void loop() {
+    // 노드 2번으로 1바이트 전송
+    node.send(2, 0x42);
+
+    // 수신 확인
+    if (node.available()) {
+        uint8_t v = node.read();
+        // ...
+    }
+}
+```
+
+## API
+
+### 노드 생성 / 초기화
+
+```cpp
+SWP2P<DataPreset> node(uint8_t nodeId);
+void node.begin(bool clkIsOutput, unsigned long clkFreq = 100000UL);
+```
+
+- `nodeId`는 7비트(0~126)로 마스킹되어 저장됩니다. `0x7F`(127)은 브로드캐스트 전용 주소로 예약되어 있습니다.
+- `clkIsOutput = true`이면 Timer1을 이용해 이 노드가 CLK을 자동 출력합니다.
+
+### 전송
+
+```cpp
+bool node.send(uint8_t destId, uint8_t data);
+bool node.sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len);
+```
+
+- `send()`는 1바이트 전용 빠른 경로(LEN 필드 없음)입니다.
+- `sendBurst()`는 `len > 1`일 때 목적지 주소의 MSB에 burst 플래그가 자동으로 세팅되고, LEN 필드(`len-2` 인코딩)가 추가로 전송됩니다. `len`은 1~`SWP2P_MAX_BURST`(기본 16, 필요 시 늘릴 수 있음) 범위여야 합니다.
+- 이미 전송 중이거나(`isSending()`) 버스가 사용 중이면(`isBusy()`) `false`를 반환합니다.
+- `destId`로 `SWP2P<PRESET>::BROADCAST`를 사용하면 모든 노드에 브로드캐스트됩니다.
+
+### 수신
+
+```cpp
+bool node.available();
+uint8_t node.read();
+uint8_t node.readBytes(uint8_t* outBuf, uint8_t maxLen);
+uint8_t node.peek();
+void node.flush();
+```
+
+수신 데이터는 내부 FIFO(`SWP2P_FIFO_DEPTH`, 기본 16, 2의 거듭제곱이어야 함)에 쌓이며, 자신에게 보내진 패킷 또는 브로드캐스트 패킷만 FIFO에 들어옵니다.
+
+### 상태 확인
+
+```cpp
+bool node.isSending();
+bool node.isBusy();
+```
+
+### 버퍼 API (`SWP2PBuffer<CAP>`)
+
+여러 바이트를 비트/바이트 단위로 모아서 한 번에 버스트 전송할 때 사용합니다.
+
+```cpp
+SWP2PBuffer<16> buf;
+
+// 비트 하나씩 밀어넣기 (8개 모이면 바이트 1개 완성)
+node.buff(buf, digitalRead(10));
+
+// 바이트 단위로 밀어넣기
+node.buff(buf, someByte, true);
+
+// buffer 전체(len()만큼) 전송
+node.sendBurst(destId, buf);
+
+// buf[4]부터 8바이트만 전송
+node.sendBurst(destId, buf, 4, 8);
+
+// buffer 전체 비우기
+node.buffFree(buf);
+
+// buf[2] 위치의 값만 0으로 비우기 (count는 그대로, 뒤 데이터는 당겨지지 않음)
+node.buffFree(buf, 2);
+```
+
+- `SWP2PBuffer<CAP>`의 `CAP`은 컴파일타임 상수이며, `CAP > SWP2P_MAX_BURST`이면 컴파일 에러가 발생합니다.
+- `buffFree(buf, idx)`는 삭제가 아니라 해당 위치 값을 0으로 덮어쓰는 동작입니다. `count`(버퍼 길이)에는 영향을 주지 않으므로, 이후 `sendBurst(dest, buf)`를 호출하면 그 자리의 0x00도 실제 데이터로 함께 전송됩니다.
+
+### `DataPreset` (데이터선 구성)
+
+| Preset | 데이터선 | 폭 |
+|---|---|---|
+| `PRESET_W1_D4`~`PRESET_W1_D10`, `PRESET_W1_A0` | 1개 | 1비트 |
+| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_D9_D10`, `PRESET_W2_A0_A1` | 2개 | 2비트 |
+| `PRESET_W4_D4_D7`, `PRESET_W4_A0_A3`, `PRESET_W4_D9_D12` | 4개 | 4비트 |
+| `PRESET_W8_A0_D7` | 8개 | 8비트 |
+
+폭이 넓을수록 한 번의 클럭 엣지에 더 많은 비트를 실어 보내 전송 사이클 수는 줄지만, 실측상 ISR 처리 시간이 병목이 되어 최대 클럭 주파수는 오히려 낮아지는 경향이 있었습니다(내부 실측 기준: WIDTH=1에서 약 40kHz, WIDTH=8에서 약 29kHz). 용도에 맞게 트레이드오프를 고려해 선택하세요.
+
+## 프로토콜 개요
+
+1. **ARB (중재)**: CLK 상승 에지마다 `dest`(1바이트, MSB=burst 플래그) + `src`(1바이트) 총 2바이트를 open-drain으로 구동하고, 하강 에지에 되읽어 비교합니다. 자신이 구동한 값보다 버스 값이 더 "0"에 가까우면(상대가 더 우선순위 높은 값을 구동 중이면) 즉시 양보하고 `TX_LOST` 상태로 전환, BUSY_N이 idle로 돌아오면 자동 재시도합니다.
+2. **LEN (버스트일 때만)**: `len - 2` 값을 인코딩해 전송합니다(단일 바이트 전송에는 없는 단계).
+3. **DATA**: 1바이트(단일 전송) 또는 `len`바이트(버스트)를 순서대로 전송합니다.
+4. **RELEASE/ACK**: 송신 측은 데이터선을 놓고(release) 종료하며, 수신 측은 ACK_N을 통해 수신을 확인합니다.
+
+수신 측은 자신의 주소(또는 브로드캐스트) 패킷만 FIFO에 캡처하고, 그 외 패킷은 라인 상태만 따라가며 무시합니다.
+
+## 설계상 제약 / 주의사항
+
+- 데이터선은 반드시 풀업 저항이 있는 open-drain 구성이어야 합니다 (풀업이 없으면 통신 자체가 불가능함을 실측으로 확인).
+- 노드 ID는 0~126만 사용 가능하며, 127(`SWP2P_BROADCAST`)은 브로드캐스트 전용입니다.
+- `SWP2P_MAX_BURST`(기본 16)를 늘리면 이론상 최대 257바이트까지 버스트 전송이 가능하지만, RAM 사용량이 함께 증가합니다.
+- 클럭 주파수는 사용 환경(풀업 저항값, 배선, WIDTH 설정)에 따라 상한이 달라지므로 실측을 통해 조정하는 것을 권장합니다.
+
+## 파일 구성
+
+- `SWP2P.h` — `SWP2PBase`(공통 static 상태) + `SWP2P<DataPreset>` 템플릿 클래스(핀 구성별 컴파일타임 특수화)
+- `SWP2P.cpp` — static 멤버 정의, Timer1 설정, ISR(INT0/INT1/PCINT0) 브릿지
+- `SWP2PBuffer.h` — 비트/바이트 단위로 데이터를 모으는 사용자 친화 버퍼 템플릿 클래스
