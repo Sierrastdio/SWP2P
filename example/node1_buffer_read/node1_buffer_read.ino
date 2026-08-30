@@ -6,6 +6,7 @@
 
 // 4비트 데이터선 규격(D4~D7) 및 Node ID 0x01 설정
 SWP2P<PRESET_W4_D4_D7> node(0x01);
+SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // 노드의 PRESET과 반드시 동일해야 함
 
 // 버스트 데이터를 담을 버퍼 생성 (최대 16바이트)
 SWP2PBuffer<16> myBuf;

@@ -4,6 +4,7 @@
 
 // 4비트 데이터선 규격(D4~D7) 및 Node ID 0x02 설정
 SWP2P<PRESET_W4_D4_D7> node(0x02);
+SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // 노드의 PRESET과 반드시 동일해야 함
 
 void setup() {
     Serial.begin(115200);

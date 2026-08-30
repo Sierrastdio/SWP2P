@@ -22,7 +22,7 @@
 #define FLAG_IS_BUSY      1
 #define FLAG_RX_CAPTURED  2
 #define FLAG_IS_MY_PACKET 3
-#define FLAG_RX_IS_BURST  4   // 신규: 이번 수신 프레임이 burst인지 (RX_SRC 완료 시점에 결정되어 저장됨)
+#define FLAG_RX_IS_BURST  4   // 이번 수신 프레임이 burst인지 (RX_SRC 완료 시점에 결정되어 저장됨)
 
 #define SET_FLAG(b) (GPIOR0 |= (1 << (b)))
 #define CLR_FLAG(b) (GPIOR0 &= ~(1 << (b)))
@@ -35,9 +35,9 @@ enum DataPreset : uint8_t {
     PRESET_W8_A0_D7
 };
 
-// ---- Tx/Rx 상태 번호 (원래 코드의 번호를 최대한 유지하고, LEN 단계만 새로 끼워 넣음) ----
-// Tx: 0 IDLE, 1 PENDING, 2 ARB, 3 LEN(신규), 4 DATA(원래 3번이었음), 5 RELEASE/DONE(원래와 동일), 6 LOST
-// Rx: 0 IDLE, 1 ADDR, 2 SRC, 3 LEN(신규), 4 DATA(원래 3번이었음), 5 ACK(원래 4번이었음)
+// ---- Tx/Rx 상태 번호 ----
+// Tx: 0 IDLE, 1 PENDING, 2 ARB, 3 LEN, 4 DATA, 5 RELEASE/DONE, 6 LOST
+// Rx: 0 IDLE, 1 ADDR, 2 SRC, 3 LEN, 4 DATA, 5 ACK
 
 class SWP2PBase {
 public:
@@ -64,16 +64,16 @@ public:
     static volatile uint8_t _rxSrcByte;
     static volatile uint8_t _rxDataByte;   // 데이터 바이트 수신용 + LEN 필드 수신에도 재사용
     static volatile uint8_t _rxChunkCount;
-    static volatile uint8_t _rxLen;        // 이번 프레임에서 받아야 할 총 바이트 수 (신규)
-    static volatile uint8_t _rxByteIdx;    // 지금까지 받은 바이트 수 (신규)
+    static volatile uint8_t _rxLen;        // 이번 프레임에서 받아야 할 총 바이트 수
+    static volatile uint8_t _rxByteIdx;    // 지금까지 받은 바이트 수
 
     static void _fifoPush(uint8_t val);
     static void setupTimer1(unsigned long freq);
     static void stopTimer1();
 
-    // ISR 브릿지 포인터 (템플릿 인스턴스 핸들러를 ISR에서 안전하게 호출하기 위함)
-    static void (*_isrClkCallback)();
-    static void (*_isrBusyCallback)();
+    // 주의: 함수 포인터 기반 ISR 브릿지는 제거됨.
+    // ISR은 파일 하단의 SWP2P_BIND_ISRS(PRESET) 매크로로 컴파일타임에 직접 바인딩한다.
+    // (icall/ret 오버헤드 및 별도 프롤로그/에필로그 생성을 없애 ISR 실행시간을 줄이기 위함)
 };
 
 template <DataPreset PRESET>
@@ -103,21 +103,28 @@ public:
         if (clkIsOutput) {
             DDRB |= (1 << DDB1);
             setupTimer1(clkFreq);
+        } else {
+            // ICU(Input Capture Unit)가 동작하려면 Timer1이 최소한 프리러닝 상태여야 함
+            // (엣지 검출 자체는 프리스케일러와 무관하지만, 안전하게 CS10만 켜둔다)
+            TCCR1A = 0;
+            TCCR1B = (1 << CS10);
         }
 
+        // ---- ACK_N(D8 = PB0 = ICP1) 엣지 감지: PCINT 폴링 대신 Input Capture Unit 사용 ----
+        // 기존 코드는 PCINT0로 8개 핀을 통째로 스캔하는 방식이었고 ISR 본체도 비어있었다.
+        // ICP1은 마침 ACK_N 핀(PB0)과 정확히 겹치므로, 하드웨어 엣지검출+노이즈캔슬러를
+        // 그대로 활용해 더 가볍고 신뢰성 높은 방식으로 대체한다.
+        TCCR1B |= (1 << ICNC1);  // 노이즈 캔슬러 on
+        TCCR1B |= (1 << ICES1);  // 우선 rising edge부터 포착 (엣지가 잡힐 때마다 ISR에서 극성 토글)
+        TIMSK1 |= (1 << ICIE1);  // Input Capture 인터럽트 활성화
+
         EICRA &= ~((1 << ISC01) | (1 << ISC00));
-        EICRA |= (1 << ISC00);
+        EICRA |= (1 << ISC00);   // INT0: CLK, any logical change
         EIMSK |= (1 << INT0);
 
         EICRA &= ~((1 << ISC11) | (1 << ISC10));
-        EICRA |= (1 << ISC10);
+        EICRA |= (1 << ISC10);   // INT1: BUSY_N, any logical change
         EIMSK |= (1 << INT1);
-
-        PCICR |= (1 << PCIE0);
-        PCMSK0 |= (1 << PCINT0);
-
-        _isrClkCallback = _onClkEdge;
-        _isrBusyCallback = _onBusyEdge;
 
         sei();
     }
@@ -150,12 +157,10 @@ public:
     }
 
     // ---- 사용자 친화 buffer API ----
-    // 비트를 하나씩 밀어넣어 buffer를 자동으로 채운다. (SWP2PBuffer.h의 SWP2PBuffer<CAP> 사용)
     template <uint8_t CAP>
     bool buff(SWP2PBuffer<CAP>& buf, bool bit) {
         return buf.pushBit(bit);
     }
-    // 바이트 단위로 밀어넣고 싶을 때
     template <uint8_t CAP>
     bool buff(SWP2PBuffer<CAP>& buf, uint8_t byteVal, bool /*asByte*/) {
         return buf.pushByte(byteVal);
@@ -166,17 +171,12 @@ public:
     template <uint8_t CAP>
     void buffFree(SWP2PBuffer<CAP>& buf, uint8_t idx) { buf.clearBuffer(idx); }
 
-    // buffer 전체(len()만큼) 전송
     template <uint8_t CAP>
     bool sendBurst(uint8_t destId, SWP2PBuffer<CAP>& buf) {
-        // CAP이 SWP2P_MAX_BURST보다 큰 buffer 타입 자체를 설계 단계에서 컴파일 에러로 잡는다.
-        // (런타임에는 아래 sendBurst(uint8_t*, uint8_t)의 len 체크가 이미 막아주지만,
-        //  애초에 이런 buffer를 만드는 실수를 조기에 알려주기 위함)
         static_assert(CAP <= SWP2P_MAX_BURST,
             "SWP2PBuffer CAP exceeds SWP2P_MAX_BURST - reduce CAP or increase SWP2P_MAX_BURST");
         return sendBurst(destId, buf.data, buf.len());
     }
-    // buffer의 offset부터 len개만 잘라서 전송 (범위 벗어나면 false)
     template <uint8_t CAP>
     bool sendBurst(uint8_t destId, SWP2PBuffer<CAP>& buf, uint8_t offset, uint8_t len) {
         static_assert(CAP <= SWP2P_MAX_BURST,
@@ -284,29 +284,36 @@ public:
     static constexpr uint8_t ARB_SHIFT = 16 - DATA_WIDTH;
     static constexpr uint8_t TX_SHIFT = 8 - DATA_WIDTH;
 
+    // ============================================================
+    // CLK 엣지 핸들러 (INT0) - volatile 캐싱 최적화 적용
+    // 반복 빈도가 가장 높은 두 구간(ARB 진행, DATA 진행)에서 volatile
+    // 멤버를 여러 번 읽고/쓰는 대신 지역 변수에 한 번 캐싱해서 계산 후
+    // 한 번만 써준다. 그 외(프레임당 1회만 도는 상태 전이)는 원본 그대로
+    // 두어 불필요한 리스크를 줄였다.
+    // ============================================================
     static void _onClkEdge() {
         bool clkHigh = (PIND & (1 << PIND2)) != 0;
 
         if (clkHigh) {
             if (_txState == 1) { // TX_PENDING
                 PORTD &= ~(1 << PORTD3); DDRD |= (1 << DDD3);
-                _txArbReg = ((uint16_t)_txDestId << 8) | _nodeId;
-                _arbChunkCount = 2 * ARB_CYCLES;
+                uint16_t arbReg = ((uint16_t)_txDestId << 8) | _nodeId;
+                uint8_t myChunk = (arbReg >> ARB_SHIFT) & DATA_MASK;
+                arbReg <<= DATA_WIDTH;
+                _driveDataChunk(myChunk);
+                _txArbReg = arbReg;
+                _arbMyChunk = myChunk;
+                _arbChunkCount = (2 * ARB_CYCLES) - 1;
                 _txState = 2; // TX_ARB
-
-                _arbMyChunk = (_txArbReg >> ARB_SHIFT) & DATA_MASK;
-                _txArbReg <<= DATA_WIDTH;
-                _driveDataChunk(_arbMyChunk);
-                _arbChunkCount--;
                 return;
             }
 
             if (_txState == 2) { // TX_ARB
-                if (_arbChunkCount == 0) {
+                uint8_t chunkCnt = _arbChunkCount;
+                if (chunkCnt == 0) {
                     // 중재(주소 2바이트: dest+src) 완료 -> burst 여부에 따라 분기
                     if (_txLen > 1) {
-                        // LEN 필드 전송 시작: len-2를 인코딩 (len은 2~SWP2P_MAX_BURST이므로 0..(MAX-2) 범위)
-                        _txDataReg = _txLen - 2;
+                        _txDataReg = _txLen - 2; // LEN 필드 (len-2 인코딩)
                         _txDataChunkCount = ARB_CYCLES;
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
                         _txDataReg <<= DATA_WIDTH;
@@ -315,8 +322,7 @@ public:
                         _txIdx = 0;
                         _txState = 3; // TX_LEN
                     } else {
-                        // 기존 단일 바이트 빠른 경로 - 완전히 그대로
-                        _txDataReg = _txData;
+                        _txDataReg = _txData; // 기존 단일 바이트 빠른 경로
                         _txDataChunkCount = ARB_CYCLES;
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
                         _txDataReg <<= DATA_WIDTH;
@@ -325,14 +331,17 @@ public:
                         _txState = 4; // TX_DATA
                     }
                 } else {
-                    _arbMyChunk = (_txArbReg >> ARB_SHIFT) & DATA_MASK;
-                    _txArbReg <<= DATA_WIDTH;
-                    _driveDataChunk(_arbMyChunk);
-                    _arbChunkCount--;
+                    // ---- 핫패스: 캐싱 적용 ----
+                    uint16_t arbReg = _txArbReg;
+                    uint8_t myChunk = (arbReg >> ARB_SHIFT) & DATA_MASK;
+                    arbReg <<= DATA_WIDTH;
+                    _driveDataChunk(myChunk);
+                    _txArbReg = arbReg;
+                    _arbMyChunk = myChunk;
+                    _arbChunkCount = chunkCnt - 1;
                 }
-            } else if (_txState == 3) { // TX_LEN (신규)
+            } else if (_txState == 3) { // TX_LEN
                 if (_txDataChunkCount == 0) {
-                    // LEN 필드 끝 -> 첫 데이터 바이트 시작
                     _txDataReg = _txBuffer[0];
                     _txDataChunkCount = ARB_CYCLES;
                     uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
@@ -341,12 +350,14 @@ public:
                     _txDataChunkCount--;
                     _txState = 4; // TX_DATA
                 } else {
-                    uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
-                    _txDataReg <<= DATA_WIDTH;
+                    uint8_t dataReg = _txDataReg;
+                    uint8_t chunk = (dataReg >> TX_SHIFT) & DATA_MASK;
+                    dataReg <<= DATA_WIDTH;
                     _driveDataChunk(chunk);
+                    _txDataReg = dataReg;
                     _txDataChunkCount--;
                 }
-            } else if (_txState == 4) { // TX_DATA (원래 3번)
+            } else if (_txState == 4) { // TX_DATA
                 if (_txDataChunkCount == 0) {
                     _txIdx++;
                     if (_txLen > 1 && _txIdx < _txLen) {
@@ -358,12 +369,15 @@ public:
                         _txDataChunkCount--;
                     } else {
                         _dataRelease();
-                        _txState = 5; // TX_RELEASE/DONE (원래와 동일)
+                        _txState = 5; // TX_RELEASE/DONE
                     }
                 } else {
-                    uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
-                    _txDataReg <<= DATA_WIDTH;
+                    // ---- 핫패스: 캐싱 적용 ----
+                    uint8_t dataReg = _txDataReg;
+                    uint8_t chunk = (dataReg >> TX_SHIFT) & DATA_MASK;
+                    dataReg <<= DATA_WIDTH;
                     _driveDataChunk(chunk);
+                    _txDataReg = dataReg;
                     _txDataChunkCount--;
                 }
             } else if (_txState == 5) {
@@ -372,7 +386,7 @@ public:
                 _txState = 0;
             }
         } else {
-            if (_txState == 2) { // TX_ARB negedge: 되읽기 검증 (원래와 동일)
+            if (_txState == 2) { // TX_ARB negedge: 되읽기 검증
                 uint8_t busVal = _readDataChunk();
                 if ((_arbMyChunk & ~busVal) != 0) {
                     _dataRelease();
@@ -384,7 +398,30 @@ public:
             }
             if (_txState != 0) return;
 
-            if (_rxState == 1) { // RX_ADDR
+            // ---- RX 상태 분기를 빈도순으로 재배치: DATA가 가장 오래 머무는 상태이므로 맨 앞으로 ----
+            uint8_t rxState = _rxState;
+
+            if (rxState == 4) { // RX_DATA - 핫패스, 캐싱 적용
+                uint8_t v = _readDataChunk();
+                uint8_t dataByte = (_rxDataByte << DATA_WIDTH) | v;
+                uint8_t chunkCnt = _rxChunkCount - 1;
+                if (chunkCnt == 0) {
+                    if (GET_FLAG(FLAG_IS_MY_PACKET)) {
+                        _fifoPush(dataByte);
+                        SET_FLAG(FLAG_RX_CAPTURED);
+                    }
+                    _rxByteIdx++;
+                    if (_rxByteIdx < _rxLen) {
+                        _rxDataByte = 0;
+                        _rxChunkCount = ARB_CYCLES;
+                    } else {
+                        _rxState = 5; // RX_ACK
+                    }
+                } else {
+                    _rxDataByte = dataByte;
+                    _rxChunkCount = chunkCnt;
+                }
+            } else if (rxState == 1) { // RX_ADDR
                 uint8_t v = _readDataChunk();
                 _rxAddrByte = (_rxAddrByte << DATA_WIDTH) | v;
                 _rxChunkCount--;
@@ -401,18 +438,16 @@ public:
                     _rxChunkCount = ARB_CYCLES;
                     _rxState = 2; // RX_SRC
                 }
-            } else if (_rxState == 2) { // RX_SRC
+            } else if (rxState == 2) { // RX_SRC
                 uint8_t v = _readDataChunk();
                 _rxSrcByte = (_rxSrcByte << DATA_WIDTH) | v;
                 _rxChunkCount--;
                 if (_rxChunkCount == 0) {
                     if (GET_FLAG(FLAG_RX_IS_BURST)) {
-                        // LEN 필드 수신 시작 (_rxDataByte를 임시 누산기로 재사용)
                         _rxDataByte = 0;
                         _rxChunkCount = ARB_CYCLES;
                         _rxState = 3; // RX_LEN
                     } else {
-                        // 기존 단일 바이트 경로 - 완전히 그대로
                         _rxDataByte = 0;
                         _rxChunkCount = ARB_CYCLES;
                         _rxLen = 1;
@@ -420,7 +455,7 @@ public:
                         _rxState = 4; // RX_DATA
                     }
                 }
-            } else if (_rxState == 3) { // RX_LEN (신규)
+            } else if (rxState == 3) { // RX_LEN
                 uint8_t v = _readDataChunk();
                 _rxDataByte = (_rxDataByte << DATA_WIDTH) | v;
                 _rxChunkCount--;
@@ -431,25 +466,7 @@ public:
                     _rxChunkCount = ARB_CYCLES;
                     _rxState = 4; // RX_DATA
                 }
-            } else if (_rxState == 4) { // RX_DATA (원래 3번)
-                uint8_t v = _readDataChunk();
-                _rxDataByte = (_rxDataByte << DATA_WIDTH) | v;
-                _rxChunkCount--;
-                if (_rxChunkCount == 0) {
-                    if (GET_FLAG(FLAG_IS_MY_PACKET)) {
-                        _fifoPush(_rxDataByte);
-                        SET_FLAG(FLAG_RX_CAPTURED);
-                    }
-                    _rxByteIdx++;
-                    if (_rxByteIdx < _rxLen) {
-                        // burst의 다음 바이트를 이어서 수신 (RX_DATA에 계속 머무름)
-                        _rxDataByte = 0;
-                        _rxChunkCount = ARB_CYCLES;
-                    } else {
-                        _rxState = 5; // RX_ACK (원래 4번)
-                    }
-                }
-            } else if (_rxState == 5) { // RX_ACK
+            } else if (rxState == 5) { // RX_ACK
                 PORTB &= ~(1 << PORTB0); DDRB |= (1 << DDB0);
                 _rxState = 0;
             }
@@ -469,7 +486,7 @@ public:
             _rxLen = 0;
             _rxByteIdx = 0;
 
-            if (_txState == 6) { // TX_LOST -> 재시도 (기존과 동일. _txLen/_txBuffer는 그대로 살아있어 burst 재시도도 안전)
+            if (_txState == 6) { // TX_LOST -> 재시도
                 _txState = 1;
                 SET_FLAG(FLAG_IS_SENDING);
             }
@@ -482,6 +499,35 @@ public:
             }
         }
     }
+
+    // ============================================================
+    // ACK_N(D8=PB0=ICP1) 엣지 핸들러 - Input Capture Unit(TIMER1_CAPT)
+    // 기존 PCINT0 기반 스캔(본체는 비어있었음)을 대체.
+    // 현재 프로토콜은 별도 타임스탬프를 쓰지 않으므로 엣지 발생 자체만
+    // 소비하고 다음 엣지(반대 극성)를 잡도록 극성만 토글한다.
+    // 향후 정밀 타이밍 기반 흐름제어가 필요해지면 ICR1 레지스터 값을
+    // 여기서 함께 읽어 활용하면 된다.
+    // ============================================================
+    static void _onAckCapture() {
+        TCCR1B ^= (1 << ICES1);
+    }
 };
+
+// ============================================================
+// ISR 직접 바인딩 매크로
+// 함수 포인터 간접호출(icall)과 그로 인한 별도 함수 프롤로그/에필로그
+// 생성을 없애기 위해, 실제 사용하는 PRESET으로 ISR을 컴파일타임에
+// 직접 바인딩한다. .ino 또는 .cpp 파일에서 노드를 선언한 뒤
+// 전역 스코프에서 딱 한 번 호출한다:
+//
+//   SWP2P<PRESET_W1_D4> node(1);
+//   SWP2P_BIND_ISRS(PRESET_W1_D4);   // <- 노드의 PRESET과 반드시 동일해야 함
+//
+// 한 펌웨어에 SWP2P 노드를 하나만 쓰는 일반적인 경우를 전제로 한다.
+// ============================================================
+#define SWP2P_BIND_ISRS(PRESET_TYPE) \
+    ISR(INT0_vect)        { SWP2P<PRESET_TYPE>::_onClkEdge(); } \
+    ISR(INT1_vect)        { SWP2P<PRESET_TYPE>::_onBusyEdge(); } \
+    ISR(TIMER1_CAPT_vect) { SWP2P<PRESET_TYPE>::_onAckCapture(); }
 
 #endif

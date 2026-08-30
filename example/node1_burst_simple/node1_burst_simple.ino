@@ -8,6 +8,7 @@
 
 
 SWP2P<PRESET_W4_D4_D7> node(0x01); // Master Node ID: 0x01
+SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // 노드의 PRESET과 반드시 동일해야 함
 
 unsigned long lastSendTime = 0;
 uint16_t packetCounter = 0;

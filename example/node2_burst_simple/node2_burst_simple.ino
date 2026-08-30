@@ -8,6 +8,8 @@
 
 
 SWP2P<PRESET_W4_D4_D7> node(0x02); // Slave Node ID: 0x02
+SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // 노드의 PRESET과 반드시 동일해야 함
+
 
 void setup() {
     Serial.begin(115200);

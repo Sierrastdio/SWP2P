@@ -27,9 +27,6 @@ volatile uint8_t SWP2PBase::_rxChunkCount = 0;
 volatile uint8_t SWP2PBase::_rxLen = 0;
 volatile uint8_t SWP2PBase::_rxByteIdx = 0;
 
-void (*SWP2PBase::_isrClkCallback)() = nullptr;
-void (*SWP2PBase::_isrBusyCallback)() = nullptr;
-
 void SWP2PBase::_fifoPush(uint8_t val) {
     if (_rxCount >= SWP2P_FIFO_DEPTH) return;
     _rxFifo[_rxHead] = val;
@@ -48,12 +45,13 @@ void SWP2PBase::setupTimer1(unsigned long freq) {
 }
 void SWP2PBase::stopTimer1() { TCCR1B = 0; }
 
-ISR(INT0_vect) {
-    if (SWP2PBase::_isrClkCallback) SWP2PBase::_isrClkCallback();
-}
-ISR(INT1_vect) {
-    if (SWP2PBase::_isrBusyCallback) SWP2PBase::_isrBusyCallback();
-}
-ISR(PCINT0_vect) {
-    // Ack edge handler (현재 미사용 - 원본과 동일하게 비워둠)
-}
+// ---- ISR 정의는 더 이상 여기 없음 ----
+// 함수 포인터 간접호출 오버헤드를 없애기 위해, 실제 사용하는 PRESET으로
+// ISR을 컴파일타임에 직접 바인딩해야 한다. 노드를 선언한 .ino/.cpp에서
+// 아래처럼 한 번만 호출하면 된다:
+//
+//   SWP2P<PRESET_W1_D4> node(1);
+//   SWP2P_BIND_ISRS(PRESET_W1_D4);
+//
+// 또한 기존 ISR(PCINT0_vect)(ACK_N 감지용, 본체는 비어있었음)는 제거되고
+// Input Capture Unit(TIMER1_CAPT_vect) 기반으로 대체되었다 (SWP2P.h 참고).

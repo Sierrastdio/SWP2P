@@ -8,8 +8,9 @@
 
 const DataPreset PRESET = PRESET_W4_D4_D7;
 
-// 템플릿 인자로 프리셋을 고정하여 switch-case를 완전히 없애고 극대화된 속도 확보
-SWP2P<PRESET> node(0x01);
+SWP2P<PRESET_W4_D4_D7> node(0x01);
+SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // 노드의 PRESET과 반드시 동일해야 함
+
 
 unsigned long lastSendTime = 0;
 uint8_t txCounter = 0;
