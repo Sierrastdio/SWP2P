@@ -1,6 +1,6 @@
 /*
  * -------------------------------------------------------------------------------------------------
- * 'node2_burst_simple.ino' is a simple burst frame sync receive example (Node 0x02)
+ * 'node2_burst_simple.ino' is a simple burst frame receive example (Node 0x02)
  * -------------------------------------------------------------------------------------------------
  */
 

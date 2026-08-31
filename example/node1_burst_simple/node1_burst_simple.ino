@@ -17,28 +17,28 @@ void setup() {
     Serial.begin(115200);
     while (!Serial);
 
-    // Master 모드: 내부 타이머1을 사용해 50kHz 클럭 생성
+    // Start as CLK Master node (50kHz)
     p2p.begin(true, 50000UL);
     Serial.println(F("=== SWP2P Node 0x01 (Burst Tx Master) Initialized ==="));
 }
 
 void loop() {
-    // 1초(1000ms) 주기 전송 타이머
+    // 1-second (1000ms) interval transmission timer
     if (millis() - lastSendTime >= 1000) {
         lastSendTime = millis();
 
-        // 버스가 비어 있고 전송 중이 아닐 때만 시도
+        // Attempt transmission only when bus is idle and not currently sending
         if (!p2p.isSending() && !p2p.isBusy()) {
             packetCounter++;
 
-            // 송신할 버스트 데이터 패킷 준비 (4바이트)
+            // Prepare burst data packet to transmit (4 bytes)
             uint8_t txPayload[4];
             txPayload[0] = 0xDE;
             txPayload[1] = 0xAD;
-            txPayload[2] = (uint8_t)(packetCounter >> 8);   // 패킷 카운터 High 바이트
-            txPayload[3] = (uint8_t)(packetCounter & 0xFF); // 패킷 카운터 Low 바이트
+            txPayload[2] = (uint8_t)(packetCounter >> 8);   // Packet counter High byte
+            txPayload[3] = (uint8_t)(packetCounter & 0xFF); // Packet counter Low byte
 
-            // Node 0x02를 향해 4바이트 버스트 송신 요청
+            // Request 4-byte burst transmission to Node 0x02
             if (p2p.sendBurst(0x02, txPayload, 4)) {
                 Serial.print(F("[TX Burst] Sent 4 Bytes to Node 0x02 -> Count: "));
                 Serial.println(packetCounter);

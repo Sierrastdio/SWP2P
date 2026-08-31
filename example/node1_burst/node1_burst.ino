@@ -1,3 +1,10 @@
+/*
+ * -------------------------------------------------------------------------------------------------
+ * 'node1_burst.ino' is an example sketch for sending buffer data to 'node2_burst.ino' every 2 second.
+ * -------------------------------------------------------------------------------------------------
+ */
+
+
 #include <Arduino.h>
 #include "SWP2P.h"
 #include "SWP2PBuffer.h"
@@ -12,7 +19,7 @@ SWP2PBuffer<16> myBuf;
 void setup() {
     Serial.begin(115200);
 
-    // CLK Master 노드로 시작 (50kHz)
+    // Start as CLK Master node (50kHz)
     p2p.begin(true, 50000UL);
 
     Serial.println(F("[Node 1] SWP2P 4-Bit Burst Sender Initialized (D4~D7)"));

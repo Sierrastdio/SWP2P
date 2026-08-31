@@ -1,3 +1,10 @@
+/*
+ * -------------------------------------------------------------------------------------------------
+ * 'node2_burst.ino' is an example sketch for receiving burst data from 'node1_burst.ino'.
+ * -------------------------------------------------------------------------------------------------
+ */
+
+
 #include <Arduino.h>
 #include "SWP2P.h"
 #include "SWP2PBuffer.h"

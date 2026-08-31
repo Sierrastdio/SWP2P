@@ -9,7 +9,7 @@
 const DataPreset PRESET = PRESET_W4_D4_D7;
 
 SWP2P<PRESET_W4_D4_D7> p2p(0x01);
-SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // 노드의 PRESET과 반드시 동일해야 함
+SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // must be same as node's PRESET
 
 
 unsigned long lastSendTime = 0;
