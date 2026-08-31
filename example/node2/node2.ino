@@ -7,8 +7,8 @@
 #include <SWP2P.h>
 
 
-SWP2P<PRESET_W4_D4_D7> node(0x02);   // node ID: 0x02
-SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // 노드의 PRESET과 반드시 동일해야 함
+SWP2P<PRESET_W4_D4_D7> p2p(0x02);   // node ID: 0x02
+SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // must be same as node's PRESET
 
 
 void setup() {
@@ -16,7 +16,7 @@ void setup() {
     Serial.begin(115200);
     while (!Serial);
 
-    node.begin(false);
+    p2p.begin(false);
     // 'false' means this node receives CLK from external source (D2). It does not generate CLK.
 
     Serial.println(F("=== SWP2P Node 0x02 Initialized (Receiver) ==="));
@@ -26,9 +26,9 @@ void setup() {
 void loop() {
 
     // check for received data
-    if (node.available()) {
+    if (p2p.available()) {
 
-        uint8_t rxData = node.read();
+        uint8_t rxData = p2p.read();
 
         Serial.print(F("[RX] Got Data from Bus -> 0x"));
         Serial.println(rxData, HEX);

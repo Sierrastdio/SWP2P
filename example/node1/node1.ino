@@ -8,7 +8,7 @@
 
 const DataPreset PRESET = PRESET_W4_D4_D7;
 
-SWP2P<PRESET_W4_D4_D7> node(0x01);
+SWP2P<PRESET_W4_D4_D7> p2p(0x01);
 SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // 노드의 PRESET과 반드시 동일해야 함
 
 
@@ -20,7 +20,7 @@ void setup() {
     Serial.begin(115200);
     while (!Serial);
 
-    node.begin(true, 50000UL);
+    p2p.begin(true, 50000UL);
     // 'true' means this node generates Timer1 CTC CLK in D9. false means this node receives CLK from external source (D2).
     // you have to connect D9 to D2 with jumper wire if you set 'true'.
     Serial.println(F("=== SWP2P Node 0x01 Initialized (CLK Generator) ==="));
@@ -28,17 +28,17 @@ void setup() {
 }
 
 void loop() {
-    // every 1 second, send counter value to node 0x02
+    // every 1 second, send counter value to p2p 0x02
     if (millis() - lastSendTime >= 1000) {
 
         lastSendTime = millis();
 
-        if (!node.isSending() && !node.isBusy()) {
+        if (!p2p.isSending() && !p2p.isBusy()) {
 
             uint8_t destNode = 0x02;
             uint8_t payload = ++txCounter;
 
-            if (node.send(destNode, payload)) {
+            if (p2p.send(destNode, payload)) {
 
                 Serial.print(F("[TX] Sent to 0x02 -> Data: 0x"));
                 Serial.println(payload, HEX);
@@ -52,9 +52,9 @@ void loop() {
     }
 
     // check for received data
-    if (node.available()) {
+    if (p2p.available()) {
 
-        uint8_t rxData = node.read();
+        uint8_t rxData = p2p.read();
 
         Serial.print(F("[RX] Received -> 0x"));
         Serial.println(rxData, HEX);
