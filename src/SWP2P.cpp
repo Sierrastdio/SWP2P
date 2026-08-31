@@ -7,7 +7,7 @@ volatile uint8_t SWP2PBase::_rxHead = 0;
 volatile uint8_t SWP2PBase::_rxTail = 0;
 volatile uint8_t SWP2PBase::_rxCount = 0;
 
-volatile uint8_t SWP2PBase::_txState = 0;
+// _txState -> GPIOR1, _rxState -> GPIOR2 (SWP2P.h의 #define 참고, 별도 정의 불필요)
 uint8_t SWP2PBase::_txDestId = 0;
 uint8_t SWP2PBase::_txData = 0;
 uint8_t SWP2PBase::_txBuffer[SWP2P_MAX_BURST];
@@ -19,7 +19,6 @@ volatile uint8_t SWP2PBase::_arbChunkCount = 0;
 volatile uint8_t SWP2PBase::_txDataChunkCount = 0;
 volatile uint8_t SWP2PBase::_arbMyChunk = 0;
 
-volatile uint8_t SWP2PBase::_rxState = 0;
 volatile uint8_t SWP2PBase::_rxAddrByte = 0;
 volatile uint8_t SWP2PBase::_rxSrcByte = 0;
 volatile uint8_t SWP2PBase::_rxDataByte = 0;

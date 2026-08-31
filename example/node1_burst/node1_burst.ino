@@ -12,8 +12,8 @@ SWP2PBuffer<16> myBuf;
 void setup() {
     Serial.begin(115200);
 
-    // CLK Master 노드로 시작 (45kHz)
-    node.begin(true, 45000UL);
+    // CLK Master 노드로 시작 (50kHz)
+    node.begin(true, 50000UL);
 
     Serial.println(F("[Node 1] SWP2P 4-Bit Burst Sender Initialized (D4~D7)"));
 }

@@ -47,7 +47,13 @@ public:
     static volatile uint8_t _rxTail;
     static volatile uint8_t _rxCount;
 
-    static volatile uint8_t _txState;
+    // _txState/_rxState는 SRAM 대신 GPIOR1/GPIOR2에 직접 상주시킨다.
+    // (I/O 레지스터 접근은 1사이클, SRAM 변수 접근은 2사이클 -> ISR에서
+    //  가장 자주 읽고 쓰는 두 값이라 누적 이득이 있음. avr/io.h가 정의하는
+    //  GPIOR1/GPIOR2를 코드 전체에서 _txState/_rxState 대신 직접 참조한다.)
+    #define _txState GPIOR1
+    #define _rxState GPIOR2
+
     static uint8_t _txDestId;      // MSB=burst 플래그가 이미 인코딩된 상태로 저장됨
     static uint8_t _txData;        // len==1일 때만 사용 (기존 빠른 경로 그대로 유지)
     static uint8_t _txBuffer[SWP2P_MAX_BURST]; // len>1일 때 사용
@@ -59,7 +65,6 @@ public:
     static volatile uint8_t _txDataChunkCount;
     static volatile uint8_t _arbMyChunk;
 
-    static volatile uint8_t _rxState;
     static volatile uint8_t _rxAddrByte;
     static volatile uint8_t _rxSrcByte;
     static volatile uint8_t _rxDataByte;   // 데이터 바이트 수신용 + LEN 필드 수신에도 재사용
@@ -89,6 +94,8 @@ public:
 
     void begin(bool clkIsOutput, unsigned long clkFreq = 100000UL) {
         GPIOR0 = 0;
+        _txState = 0; // GPIOR1
+        _rxState = 0; // GPIOR2
 
         DDRD &= ~(1 << DDD2);
         PORTD &= ~(1 << PORTD2);
@@ -219,19 +226,22 @@ public:
 
     // Compile-time Dispatching (Switch-case 완전 제거, 컴파일러가 최적화하여 100% 인라인 전개)
     static inline void _driveDataChunk(uint8_t chunkVal) __attribute__((always_inline)) {
-        if constexpr (PRESET == PRESET_W1_D4) { if (!(chunkVal & 1)) DDRD |= (1 << DDD4); else DDRD &= ~(1 << DDD4); }
-        else if constexpr (PRESET == PRESET_W1_D5) { if (!(chunkVal & 1)) DDRD |= (1 << DDD5); else DDRD &= ~(1 << DDD5); }
-        else if constexpr (PRESET == PRESET_W1_D6) { if (!(chunkVal & 1)) DDRD |= (1 << DDD6); else DDRD &= ~(1 << DDD6); }
-        else if constexpr (PRESET == PRESET_W1_D7) { if (!(chunkVal & 1)) DDRD |= (1 << DDD7); else DDRD &= ~(1 << DDD7); }
-        else if constexpr (PRESET == PRESET_W1_D9) { if (!(chunkVal & 1)) DDRB |= (1 << DDB1); else DDRB &= ~(1 << DDB1); }
-        else if constexpr (PRESET == PRESET_W1_D10){ if (!(chunkVal & 1)) DDRB |= (1 << DDB2); else DDRB &= ~(1 << DDB2); }
-        else if constexpr (PRESET == PRESET_W1_A0) { if (!(chunkVal & 1)) DDRC |= (1 << DDC0); else DDRC &= ~(1 << DDC0); }
+        // W1(1비트) 프리셋도 W2/W4/W8과 동일하게 브랜치리스 공식으로 통일
+        // (chunkVal의 LSB=0이면 구동/=1이면 방출 -> ~chunkVal의 해당 비트를 그대로 DDR에 씀)
+        if constexpr (PRESET == PRESET_W1_D4) { DDRD = (DDRD & ~(1 << DDD4)) | ((~chunkVal & 0x01) << 4); }
+        else if constexpr (PRESET == PRESET_W1_D5) { DDRD = (DDRD & ~(1 << DDD5)) | ((~chunkVal & 0x01) << 5); }
+        else if constexpr (PRESET == PRESET_W1_D6) { DDRD = (DDRD & ~(1 << DDD6)) | ((~chunkVal & 0x01) << 6); }
+        else if constexpr (PRESET == PRESET_W1_D7) { DDRD = (DDRD & ~(1 << DDD7)) | ((~chunkVal & 0x01) << 7); }
+        else if constexpr (PRESET == PRESET_W1_D9) { DDRB = (DDRB & ~(1 << DDB1)) | ((~chunkVal & 0x01) << 1); }
+        else if constexpr (PRESET == PRESET_W1_D10){ DDRB = (DDRB & ~(1 << DDB2)) | ((~chunkVal & 0x01) << 2); }
+        else if constexpr (PRESET == PRESET_W1_A0) { DDRC = (DDRC & ~(1 << DDC0)) | (~chunkVal & 0x01); }
         else if constexpr (PRESET == PRESET_W2_D4_D5) { DDRD = (DDRD & ~0x30) | ((~chunkVal & 0x03) << 4); }
         else if constexpr (PRESET == PRESET_W2_D6_D7) { DDRD = (DDRD & ~0xC0) | ((~chunkVal & 0x03) << 6); }
         else if constexpr (PRESET == PRESET_W2_D9_D10){ DDRB = (DDRB & ~0x06) | ((~chunkVal & 0x03) << 1); }
         else if constexpr (PRESET == PRESET_W2_A0_A1) { DDRC = (DDRC & ~0x03) | (~chunkVal & 0x03); }
         else if constexpr (PRESET == PRESET_W4_D4_D7) { DDRD = (DDRD & ~0xF0) | ((~chunkVal & 0x0F) << 4); }
         else if constexpr (PRESET == PRESET_W4_A0_A3) { DDRC = (DDRC & ~0x0F) | (~chunkVal & 0x0F); }
+        else if constexpr (PRESET == PRESET_W4_D9_D12) { DDRB = (DDRB & ~0x1E) | ((~chunkVal & 0x0F) << 1); }
         else if constexpr (PRESET == PRESET_W8_A0_D7) {
             DDRC = (DDRC & ~0x0F) | (~chunkVal & 0x0F);
             DDRD = (DDRD & ~0xF0) | ((~chunkVal & 0xF0));
@@ -240,19 +250,21 @@ public:
 
     static inline uint8_t _readDataChunk() __attribute__((always_inline)) {
         uint8_t val = 0;
-        if constexpr (PRESET == PRESET_W1_D4)  val = (PIND & (1 << PIND4)) ? 1 : 0;
-        else if constexpr (PRESET == PRESET_W1_D5)  val = (PIND & (1 << PIND5)) ? 1 : 0;
-        else if constexpr (PRESET == PRESET_W1_D6)  val = (PIND & (1 << PIND6)) ? 1 : 0;
-        else if constexpr (PRESET == PRESET_W1_D7)  val = (PIND & (1 << PIND7)) ? 1 : 0;
-        else if constexpr (PRESET == PRESET_W1_D9)  val = (PINB & (1 << PINB1)) ? 1 : 0;
-        else if constexpr (PRESET == PRESET_W1_D10) val = (PINB & (1 << PINB2)) ? 1 : 0;
-        else if constexpr (PRESET == PRESET_W1_A0)  val = (PINC & (1 << PINC0)) ? 1 : 0;
+        // 삼항연산자(분기) 대신 shift+mask로 통일 (브랜치리스)
+        if constexpr (PRESET == PRESET_W1_D4)  val = (PIND >> PIND4) & 0x01;
+        else if constexpr (PRESET == PRESET_W1_D5)  val = (PIND >> PIND5) & 0x01;
+        else if constexpr (PRESET == PRESET_W1_D6)  val = (PIND >> PIND6) & 0x01;
+        else if constexpr (PRESET == PRESET_W1_D7)  val = (PIND >> PIND7) & 0x01;
+        else if constexpr (PRESET == PRESET_W1_D9)  val = (PINB >> PINB1) & 0x01;
+        else if constexpr (PRESET == PRESET_W1_D10) val = (PINB >> PINB2) & 0x01;
+        else if constexpr (PRESET == PRESET_W1_A0)  val = (PINC >> PINC0) & 0x01;
         else if constexpr (PRESET == PRESET_W2_D4_D5) val = (PIND & 0x30) >> 4;
         else if constexpr (PRESET == PRESET_W2_D6_D7) val = (PIND & 0xC0) >> 6;
         else if constexpr (PRESET == PRESET_W2_D9_D10)val = (PINB & 0x06) >> 1;
         else if constexpr (PRESET == PRESET_W2_A0_A1) val = (PINC & 0x03);
         else if constexpr (PRESET == PRESET_W4_D4_D7) val = (PIND & 0xF0) >> 4;
         else if constexpr (PRESET == PRESET_W4_A0_A3) val = (PINC & 0x0F);
+        else if constexpr (PRESET == PRESET_W4_D9_D12) val = (PINB & 0x1E) >> 1;
         else if constexpr (PRESET == PRESET_W8_A0_D7) val = (PINC & 0x0F) | (PIND & 0xF0);
         return val;
     }
@@ -271,6 +283,7 @@ public:
         else if constexpr (PRESET == PRESET_W2_A0_A1) DDRC &= ~0x03;
         else if constexpr (PRESET == PRESET_W4_D4_D7) DDRD &= ~0xF0;
         else if constexpr (PRESET == PRESET_W4_A0_A3) DDRC &= ~0x0F;
+        else if constexpr (PRESET == PRESET_W4_D9_D12) DDRB &= ~0x1E;
         else if constexpr (PRESET == PRESET_W8_A0_D7) { DDRC &= ~0x0F; DDRD &= ~0xF0; }
     }
 

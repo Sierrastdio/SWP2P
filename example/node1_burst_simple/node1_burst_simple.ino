@@ -17,8 +17,8 @@ void setup() {
     Serial.begin(115200);
     while (!Serial);
 
-    // Master 모드: 내부 타이머1을 사용해 45kHz 클럭 생성
-    node.begin(true, 45000UL);
+    // Master 모드: 내부 타이머1을 사용해 50kHz 클럭 생성
+    node.begin(true, 50000UL);
     Serial.println(F("=== SWP2P Node 0x01 (Burst Tx Master) Initialized ==="));
 }
 

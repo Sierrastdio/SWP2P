@@ -20,8 +20,8 @@ void setup() {
     // 디지털 10번 핀 입력 설정
     pinMode(INPUT_PIN, INPUT);
 
-    // CLK Master 노드로 시작 (45kHz)
-    node.begin(true, 45000UL);
+    // CLK Master 노드로 시작 (50kHz)
+    node.begin(true, 50000UL);
 
     Serial.println(F("[Node 1] Digital Pin 10 Input Stream Sender Initialized (5s Interval)"));
 }
