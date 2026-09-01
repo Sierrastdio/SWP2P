@@ -29,20 +29,37 @@ volatile uint8_t SWP2PBase::_rxByteIdx = 0;
 void SWP2PBase::_fifoPush(uint8_t val) {
     if (_rxCount >= SWP2P_FIFO_DEPTH) return;
     _rxFifo[_rxHead] = val;
+    // _rxHead = (_rxHead + 1) % SWP2P_FIFO_DEPTH 연산을 비트 마스크로 고속 처리
+    // SWP2P_FIFO_DEPTH가 16(0x10 = 0001 0000)일 때, (SWP2P_FIFO_DEPTH - 1) = 15(0x0F = 0000 1111)
+    // 0000 1111 마스킹을 통해 인덱스가 15를 초과하면 자동으로 0으로 순환(Circular Queue)
     _rxHead = (_rxHead + 1) & (SWP2P_FIFO_DEPTH - 1);
     _rxCount++;
 }
 
 void SWP2PBase::setupTimer1(unsigned long freq) {
-    TCCR1A = 0;
-    TCCR1B = 0;
-    TCNT1  = 0;
+    TCCR1A = 0; // 0x00 (0000 0000) : Timer1 제어 레지스터 A 초기화
+    TCCR1B = 0; // 0x00 (0000 0000) : Timer1 제어 레지스터 B 초기화
+    TCNT1  = 0; // 0x0000 : 타이머 카운터 값 0으로 초기화
+
+    // CTC 모드 토글 주파수 공식: F_oc1a = F_CPU / (2 * N * (1 + OCR1A))  (단, 분주비 N = 1)
+    // 설정 주파수(freq)에 맞는 OCR1A 비교 일치 값 계산
     uint16_t ocrValue = (uint16_t)((F_CPU / (2UL * freq)) - 1);
     OCR1A = ocrValue;
+
+    // COM1A0 = 1 (비트 6 set) -> CTC 비교 일치 발생 시 OC1A(PB1 / Arduino D9) 핀 토글(Toggle)
+    // TCCR1A |= (1 << COM1A0) -> 0x40 (0100 0000)
     TCCR1A |= (1 << COM1A0);
+
+    // WGM12 = 1 (비트 3 set) -> CTC 모드 설정 (TCNT1이 OCR1A에 도달하면 0으로 리셋)
+    // CS10  = 1 (비트 0 set) -> 분주비 1 (No Prescaling, 클럭 직결)
+    // TCCR1B |= (1 << WGM12) | (1 << CS10) -> (1 << 3) | (1 << 0) = 0x08 | 0x01 = 0x09 (0000 1001)
     TCCR1B |= (1 << WGM12) | (1 << CS10);
 }
-void SWP2PBase::stopTimer1() { TCCR1B = 0; }
+
+void SWP2PBase::stopTimer1() {
+    // CS12, CS11, CS10 비트를 모두 0으로 만들어 클럭 공급 차단 (타이머 정지)
+    TCCR1B = 0; // 0x00 (0000 0000)
+}
 
 // ---- ISR 정의는 더 이상 여기 없음 ----
 // 함수 포인터 간접호출 오버헤드를 없애기 위해, 실제 사용하는 PRESET으로
