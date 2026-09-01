@@ -7,8 +7,13 @@
 #include "SWP2PBuffer.h"
 
 #define SWP2P_FIFO_DEPTH 16
-#define SWP2P_MAX_BURST   16   // _txBuffer 크기. len-2를 8비트 레지스터에 실어 보내므로 이론상 257까지 가능하지만
-                              // RAM 절약 위해 우선 16으로 제한 (필요시 늘리면 됨)
+#define SWP2P_MAX_BURST   16  // _txBuffer 크기. len-2를 8비트 레지스터에 실어 보내므로 이론상 257까지 가능하지만
+                              // RAM 절약 위해 우선 16으로 제한 (필요시 늘리면 됨).
+                              // WARNING: 이거 때문에 SWP2PBuffer<32> myBuf; 와 같이 16바이트를 초과하는 버퍼를 설정할 경우,
+                              //          자동 분할 전송되지 않으며 버퍼 오버플로우가 발생할 수 있음.
+                              //          16바이트씩 두번의 통신 프레임으로 전송될것임.
+                              //          16바이트 초과 데이터 전송이 필요하면 이 상수를 해당 크기만큼 늘려야 함.
+                              //          아니면 myBuf1, myBuf2 등 한 데이터에 여러개의 버퍼를 사용해야함.
 
 // ---- 주소 인코딩 ----
 // destId 바이트의 MSB(bit7)를 "burst 프레임 여부" 플래그로 사용.
@@ -88,12 +93,14 @@ class SWP2P : public SWP2PBase {
 public:
     static constexpr uint8_t BROADCAST = SWP2P_BROADCAST;
 
-    SWP2P(uint8_t nodeId) {
+    SWP2P(uint8_t nodeId)
+    {
         // [xxxx xxxx] & [0111 1111] => [0xxx xxxx] (7비트 주소만 마스킹)
         _nodeId = nodeId & SWP2P_NODE_MASK;
     }
 
-    void begin(bool clkIsOutput, unsigned long clkFreq = 100000UL) {
+    void begin(bool clkIsOutput, unsigned long clkFreq = 100000UL)
+    {
         GPIOR0 = 0;
         _txState = 0; // GPIOR1
         _rxState = 0; // GPIOR2
@@ -135,15 +142,19 @@ public:
         sei();
     }
 
-    bool send(uint8_t destId, uint8_t data) {
+    bool send(uint8_t destId, uint8_t data)
+    {
         return sendBurst(destId, &data, 1);
     }
 
-    bool sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len) {
+    bool sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len)
+    {
         if (len == 0 || len > SWP2P_MAX_BURST) return false;
+
         if (GET_FLAG(FLAG_IS_SENDING) || GET_FLAG(FLAG_IS_BUSY)) return false;
 
         uint8_t d = destId & SWP2P_NODE_MASK; // [xxxx xxxx] & [0111 1111] => [0xxx xxxx]
+
         if (len > 1) d |= SWP2P_BURST_BIT;     // [0xxx xxxx] |= [1000 0000] => [1xxx xxxx] (Burst 비트 Set)
         _txDestId = d;
         _txLen = len;
@@ -157,69 +168,103 @@ public:
 
         _txState = 1; // TX_PENDING
         SET_FLAG(FLAG_IS_SENDING);
+
         return true;
     }
 
     template <uint8_t CAP>
-    bool buff(SWP2PBuffer<CAP>& buf, bool bit) {
+    bool buff(SWP2PBuffer<CAP>& buf, bool bit)
+    {
         return buf.pushBit(bit);
     }
+
     template <uint8_t CAP>
-    bool buff(SWP2PBuffer<CAP>& buf, uint8_t byteVal, bool /*asByte*/) {
+    bool buff(SWP2PBuffer<CAP>& buf, uint8_t byteVal, bool /*asByte*/)
+    {
         return buf.pushByte(byteVal);
     }
 
     template <uint8_t CAP>
-    void buffFree(SWP2PBuffer<CAP>& buf) { buf.clearAll(); }
-    template <uint8_t CAP>
-    void buffFree(SWP2PBuffer<CAP>& buf, uint8_t idx) { buf.clearBuffer(idx); }
+    void buffFree(SWP2PBuffer<CAP>& buf)
+    {
+        buf.clearAll();
+    }
 
     template <uint8_t CAP>
-    bool sendBurst(uint8_t destId, SWP2PBuffer<CAP>& buf) {
+    void buffFree(SWP2PBuffer<CAP>& buf, uint8_t idx)
+    {
+        buf.clearBuffer(idx);
+    }
+
+    template <uint8_t CAP>
+    bool sendBurst(uint8_t destId, SWP2PBuffer<CAP>& buf)
+    {
         static_assert(CAP <= SWP2P_MAX_BURST,
             "SWP2PBuffer CAP exceeds SWP2P_MAX_BURST - reduce CAP or increase SWP2P_MAX_BURST");
+
         return sendBurst(destId, buf.data, buf.len());
     }
+
     template <uint8_t CAP>
-    bool sendBurst(uint8_t destId, SWP2PBuffer<CAP>& buf, uint8_t offset, uint8_t len) {
+    bool sendBurst(uint8_t destId, SWP2PBuffer<CAP>& buf, uint8_t offset, uint8_t len)
+    {
         static_assert(CAP <= SWP2P_MAX_BURST,
             "SWP2PBuffer CAP exceeds SWP2P_MAX_BURST - reduce CAP or increase SWP2P_MAX_BURST");
+
         if ((uint16_t)offset + len > buf.len()) return false;
+
         return sendBurst(destId, buf.data + offset, len);
     }
 
-    bool available() { return _rxCount > 0; }
+    bool available()
+    {
+        return _rxCount > 0;
+    }
 
-    uint8_t read() {
-        if (_rxCount == 0) return 0;
+    uint8_t read()
+    {
+        if (_rxCount == 0) return 0
+
         uint8_t val = _rxFifo[_rxTail];
         // [xxxx xxxx] & [0000 1111] => [0000 xxxx] (Ring Buffer 인덱스 0~15 순환)
         _rxTail = (_rxTail + 1) & (SWP2P_FIFO_DEPTH - 1);
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             _rxCount--;
         }
+
         return val;
     }
 
-    uint8_t readBytes(uint8_t* outBuf, uint8_t maxLen) {
+    uint8_t readBytes(uint8_t* outBuf, uint8_t maxLen)
+    {
         uint8_t count = 0;
         while (count < maxLen && available()) outBuf[count++] = read();
         return count;
     }
 
-    uint8_t peek() {
+    uint8_t peek()
+    {
         if (_rxCount == 0) return 0;
         return _rxFifo[_rxTail];
     }
 
-    void flush() {
-        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    void flush()
+    {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+        {
             _rxHead = 0; _rxTail = 0; _rxCount = 0;
         }
     }
 
-    bool isSending() const { return GET_FLAG(FLAG_IS_SENDING); }
-    bool isBusy() const { return GET_FLAG(FLAG_IS_BUSY); }
+    bool isSending() const
+    {
+        return GET_FLAG(FLAG_IS_SENDING);
+    }
+
+    bool isBusy() const
+    {
+        return GET_FLAG(FLAG_IS_BUSY);
+    }
 
     // Compile-time Dispatching
     static inline void _driveDataChunk(uint8_t chunkVal) __attribute__((always_inline)) {
