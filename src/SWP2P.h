@@ -240,7 +240,7 @@ public:
 
     uint8_t read()
     {
-        if (_rxCount == 0) return 0
+        if (_rxCount == 0) return 0;
 
         uint8_t val = _rxFifo[_rxTail];
         // [xxxx xxxx] & [0000 1111] => [0000 xxxx] (Ring Buffer 인덱스 0~15 순환)
