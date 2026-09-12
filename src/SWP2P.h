@@ -153,7 +153,13 @@ public:
         EIMSK |= (1 << INT0);                    // [xxxx xxxx] |= [0000 0001] => [xxxx xxx1] (INT0 Enable)
 
         // EICRA: INT1 설정 (ISC11, ISC10 비트)
+        // 주의: Low Level(00)로 두면 D3(BUSY)가 LOW인 "동안"만 인터럽트가 걸리고, HIGH로
+        // 복귀하는 상승 엣지(=버스 idle 전환)를 감지할 방법이 없다. _onBusyEdge()의
+        // idle 분기(FLAG_IS_BUSY를 푸는 유일한 지점)가 바로 그 상승 엣지에서 실행돼야
+        // 하므로, Any Logical Change(01)로 바꿔서 양쪽 엣지를 모두 잡아야 한다.
+        // (이게 없으면 최초 1회 통신 후 FLAG_IS_BUSY가 영구히 안 풀림 -> 이후 전송 전부 조용히 무시됨)
         EICRA &= ~((1 << ISC11) | (1 << ISC10)); // [xxxx xxxx] &= [1111 1100] => [xxxx xxxx] (INT1 초기화)
+        EICRA |= (1 << ISC10);                   // [xxxx xxxx] |= [0000 0100] => [xxxx x1xx] (INT1 Any Logical Change)
         EIMSK |= (1 << INT1);                    // [xxxx xxxx] |= [0000 0010] => [xxxx xx1x] (INT1 Enable)
 
         sei();
