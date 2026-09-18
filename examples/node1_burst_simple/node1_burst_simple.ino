@@ -18,8 +18,8 @@ void setup() {
     Serial.begin(115200);
     while (!Serial);
 
-    // Start as CLK Master node (50kHz)
-    p2p.begin(true, 50000UL);
+    // Start as CLK Master node (48kHz)
+    p2p.begin(true, 48000UL);
     Serial.println(F("=== SWP2P Node 0x01 (Burst Tx Master) Initialized ==="));
 }
 
