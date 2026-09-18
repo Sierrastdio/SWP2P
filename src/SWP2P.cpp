@@ -20,6 +20,7 @@ static_assert((SWP2P_FIFO_DEPTH & (SWP2P_FIFO_DEPTH - 1)) == 0, "SWP2P_FIFO_DEPT
 
 uint8_t SWP2PBase::_nodeId = 0;
 volatile uint8_t SWP2PBase::_rxFifo[SWP2P_FIFO_DEPTH];
+volatile uint8_t SWP2PBase::_rxSrcFifo[SWP2P_FIFO_DEPTH]; // [발신자 ID 수정]
 volatile uint8_t SWP2PBase::_rxHead = 0;
 volatile uint8_t SWP2PBase::_rxTail = 0;
 volatile uint8_t SWP2PBase::_rxCount = 0;
@@ -35,6 +36,8 @@ volatile uint8_t SWP2PBase::_txDataReg = 0;
 volatile uint8_t SWP2PBase::_arbChunkCount = 0;
 volatile uint8_t SWP2PBase::_txDataChunkCount = 0;
 volatile uint8_t SWP2PBase::_arbMyChunk = 0;
+volatile uint8_t SWP2PBase::_arbChunksSent = 0; // [버그1 수정]
+volatile uint8_t SWP2PBase::_ackWaitCount = 0;  // [버그4 수정]
 
 volatile uint8_t SWP2PBase::_rxAddrByte = 0;
 volatile uint8_t SWP2PBase::_rxSrcByte = 0;
@@ -43,9 +46,10 @@ volatile uint8_t SWP2PBase::_rxChunkCount = 0;
 volatile uint8_t SWP2PBase::_rxLen = 0;
 volatile uint8_t SWP2PBase::_rxByteIdx = 0;
 
-void SWP2PBase::_fifoPush(uint8_t val) {
+void SWP2PBase::_fifoPush(uint8_t val, uint8_t srcId) { // [발신자 ID 수정]
     if (_rxCount >= SWP2P_FIFO_DEPTH) return;
     _rxFifo[_rxHead] = val;
+    _rxSrcFifo[_rxHead] = srcId; // 데이터와 같은 인덱스에 발신자 ID도 같이 저장 (한 큐에서 동기화 유지)
     // _rxHead = (_rxHead + 1) % SWP2P_FIFO_DEPTH 연산을 비트 마스크로 고속 처리
     // SWP2P_FIFO_DEPTH가 16(0x10 = 0001 0000)일 때, (SWP2P_FIFO_DEPTH - 1) = 15(0x0F = 0000 1111)
     // 0000 1111 마스킹을 통해 인덱스가 15를 초과하면 자동으로 0으로 순환(Circular Queue)

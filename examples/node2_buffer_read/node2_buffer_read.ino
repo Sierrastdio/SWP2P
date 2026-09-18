@@ -44,7 +44,8 @@ void loop() {
 
         // Read the full completed packet at once
         uint8_t rxBuffer[SWP2P_MAX_BURST];
-        uint8_t receivedLen = p2p.readBytes(rxBuffer, SWP2P_MAX_BURST);
+        uint8_t rxSrcBuffer[SWP2P_MAX_BURST];
+        uint8_t receivedLen = p2p.readBytes(rxBuffer, rxSrcBuffer, SWP2P_MAX_BURST);
 
         if (receivedLen > 0) {
             Serial.print(F("[RX Data Received] -> Hex: "));

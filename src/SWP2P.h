@@ -45,6 +45,7 @@
 #define FLAG_RX_CAPTURED  2
 #define FLAG_IS_MY_PACKET 3
 #define FLAG_RX_IS_BURST  4   // 이번 수신 프레임이 burst인지 (RX_SRC 완료 시점에 결정되어 저장됨)
+#define FLAG_ACK_FAILED   5   // 직전 송신이 ACK를 못 받고 타임아웃됐는지 (isAckFailed()로 조회)
 
 // GPIOR0 플래그 비트 연산 추적 주석 추가
 #define SET_FLAG(b) (GPIOR0 |= (1 << (b)))   // [xxxx xxxx] |= [0000 0001 << b]  => [b번 비트만 1로 Set]
@@ -74,6 +75,7 @@ class SWP2PBase {
 public:
     static uint8_t _nodeId;
     static volatile uint8_t _rxFifo[SWP2P_FIFO_DEPTH];
+    static volatile uint8_t _rxSrcFifo[SWP2P_FIFO_DEPTH]; // [발신자 ID 수정] _rxFifo와 같은 인덱스로 동기화되는 발신자 ID 큐
     static volatile uint8_t _rxHead;
     static volatile uint8_t _rxTail;
     static volatile uint8_t _rxCount;
@@ -92,6 +94,8 @@ public:
     static volatile uint8_t _arbChunkCount;
     static volatile uint8_t _txDataChunkCount;
     static volatile uint8_t _arbMyChunk;
+    static volatile uint8_t _arbChunksSent; // [버그1 수정] 이번 중재 라운드에서 "드라이브+비교까지 끝난" 청크 수(이번 것 포함)
+    static volatile uint8_t _ackWaitCount;  // [버그4 수정] ACK 대기 중 남은 edge 수 (0이면 타임아웃)
 
     static volatile uint8_t _rxAddrByte;
     static volatile uint8_t _rxSrcByte;
@@ -100,7 +104,7 @@ public:
     static volatile uint8_t _rxLen;        // 이번 프레임에서 받아야 할 총 바이트 수
     static volatile uint8_t _rxByteIdx;    // 지금까지 받은 바이트 수
 
-    static void _fifoPush(uint8_t val);
+    static void _fifoPush(uint8_t val, uint8_t srcId); // [발신자 ID 수정]
     static void setupTimer1(unsigned long freq);
     static void stopTimer1();
 };
@@ -244,31 +248,41 @@ public:
         return _rxCount > 0;
     }
 
-    uint8_t read()
+    // [발신자 ID 수정] data뿐 아니라 srcId도 반드시 같이 받아야 하도록 시그니처 자체를 강제함.
+    // 큐가 비어있으면 false를 반환하고 data/srcId는 건드리지 않는다.
+    bool read(uint8_t& data, uint8_t& srcId)
     {
-        if (_rxCount == 0) return 0;
+        if (_rxCount == 0) return false;
 
-        uint8_t val = _rxFifo[_rxTail];
+        data = _rxFifo[_rxTail];
+        srcId = _rxSrcFifo[_rxTail];
         // [xxxx xxxx] & [0000 1111] => [0000 xxxx] (Ring Buffer 인덱스 0~15 순환)
         _rxTail = (_rxTail + 1) & (SWP2P_FIFO_DEPTH - 1);
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             _rxCount--;
         }
 
-        return val;
+        return true;
     }
 
-    uint8_t readBytes(uint8_t* outBuf, uint8_t maxLen)
+    // outBuf[i]를 받은 노드가 srcBuf[i]다 (인덱스가 1:1로 대응) — 패킷마다 발신자가 다를 수 있으므로
+    // 데이터 배열만 받고 출처를 버리는 건 허용하지 않는다.
+    uint8_t readBytes(uint8_t* outBuf, uint8_t* srcBuf, uint8_t maxLen)
     {
         uint8_t count = 0;
-        while (count < maxLen && available()) outBuf[count++] = read();
+        while (count < maxLen && available()) {
+            read(outBuf[count], srcBuf[count]);
+            count++;
+        }
         return count;
     }
 
-    uint8_t peek()
+    bool peek(uint8_t& data, uint8_t& srcId)
     {
-        if (_rxCount == 0) return 0;
-        return _rxFifo[_rxTail];
+        if (_rxCount == 0) return false;
+        data = _rxFifo[_rxTail];
+        srcId = _rxSrcFifo[_rxTail];
+        return true;
     }
 
     void flush()
@@ -287,6 +301,15 @@ public:
     bool isBusy() const
     {
         return GET_FLAG(FLAG_IS_BUSY);
+    }
+
+    // [버그4 수정] 직전 sendBurst()/send()가 ACK 타임아웃으로 실패했는지 조회.
+    // 읽는 순간 플래그를 자동으로 클리어한다 (다음 전송 결과와 섞이지 않도록).
+    bool isAckFailed()
+    {
+        bool failed = GET_FLAG(FLAG_ACK_FAILED);
+        CLR_FLAG(FLAG_ACK_FAILED);
+        return failed;
     }
 
     // Compile-time Dispatching
@@ -359,6 +382,11 @@ public:
 
     static constexpr uint8_t ARB_CYCLES = (8 + DATA_WIDTH - 1) / DATA_WIDTH;
 
+    // [버그4 수정] ACK 대기 타임아웃 (falling edge 기준 카운트). 수신측은 RX_DATA 마지막 청크를
+    // 읽는 바로 그 순간(같은 클럭 사이클)에 곧장 PB0을 LOW로 구동하므로 이론상 거의 즉시 보여야
+    // 하지만, 지터/노이즈 캔슬러 지연 여유를 감안해 몇 edge 정도는 기다려준다.
+    static constexpr uint8_t ACK_WAIT_EDGES = 4;
+
     // [2^N - 1 원리] (1 << DATA_WIDTH) - 1: 하위 N비트(DATA_WIDTH 크기)만 1로 채워진 거름망 마스크 생성
     // N=1: (1<<1)-1 = 0b00000001 (0x01)
     // N=2: (1<<2)-1 = 0b00000011 (0x03)
@@ -388,6 +416,7 @@ public:
                 _driveDataChunk(myChunk);
                 _txArbReg = arbReg;
                 _arbMyChunk = myChunk;
+                _arbChunksSent = 1; // [버그1 수정] 이번이 첫 청크
                 _arbChunkCount = (2 * ARB_CYCLES) - 1;
                 _txState = 2; // TX_ARB
                 return;
@@ -422,6 +451,7 @@ public:
                     _driveDataChunk(myChunk);
                     _txArbReg = arbReg;
                     _arbMyChunk = myChunk;
+                    _arbChunksSent++; // [버그1 수정]
                     _arbChunkCount = chunkCnt - 1;
                 }
             } else if (_txState == 3) { // TX_LEN
@@ -452,8 +482,13 @@ public:
                         _driveDataChunk(chunk);
                         _txDataChunkCount--;
                     } else {
+                        // [버그4 수정] 원래는 DATA 다 보내자마자 바로 BUSY를 풀고 "성공"으로 간주했음
+                        // (상대가 실제로 받았는지 전혀 확인 안 함). 데이터 라인은 지금 놓아주되,
+                        // BUSY(D3)는 계속 잡고 ACK 대기 상태(7)로 넘어가서 PB0(ACK)이 LOW로
+                        // 내려오는지 확인한다.
                         _dataRelease();
-                        _txState = 5; // TX_RELEASE/DONE
+                        _ackWaitCount = ACK_WAIT_EDGES;
+                        _txState = 7; // TX_WAIT_ACK
                     }
                 } else {
                     uint8_t dataReg = _txDataReg;
@@ -463,24 +498,103 @@ public:
                     _txDataReg = dataReg;
                     _txDataChunkCount--;
                 }
-            } else if (_txState == 5) {
-                DDRD &= ~(1 << DDD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 BUSY 해제)
-                CLR_FLAG(FLAG_IS_SENDING);
-                _txState = 0;
             }
+            // (구 TX_RELEASE(state 5)는 [버그4 수정]으로 TX_WAIT_ACK(state 7)이 릴리즈까지
+            //  직접 처리하게 되면서 더 이상 쓰이지 않음 - falling-edge 쪽 state7 핸들러 참고)
         } else {
+            if (_txState == 7) { // [버그4 수정] TX_WAIT_ACK negedge: ACK(PB0=D8) 확인
+                bool acked = (PINB & (1 << PINB0)) == 0; // 수신측이 PB0을 LOW로 구동했는지
+                if (acked) {
+                    CLR_FLAG(FLAG_ACK_FAILED);
+                    DDRD &= ~(1 << DDD3); // BUSY 해제
+                    CLR_FLAG(FLAG_IS_SENDING);
+                    _txState = 0;
+                } else if (_ackWaitCount == 0) {
+                    // 타임아웃: ACK 못 받았지만 버스는 풀어줘야 다른 노드가 계속 쓸 수 있음
+                    SET_FLAG(FLAG_ACK_FAILED);
+                    DDRD &= ~(1 << DDD3);
+                    CLR_FLAG(FLAG_IS_SENDING);
+                    _txState = 0;
+                } else {
+                    _ackWaitCount--;
+                }
+                return;
+            }
             if (_txState == 2) { // TX_ARB negedge: 중재 충돌 검증
                 uint8_t busVal = _readDataChunk();
                 // [내가 보낸 비트] & ~[버스의 실제 비트] => 내가 0(구동)인데 버스가 1이면 충돌(패배)
                 if ((_arbMyChunk & ~busVal) != 0) {
                     _dataRelease();
-                    DDRD &= ~(1 << DDD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (BUSY 해제)
+                    DDRD &= ~(1 << DDD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (BUSY 해제 - 내 쪽만. 승자가 계속 잡고있으므로 버스 자체는 그대로 busy)
                     CLR_FLAG(FLAG_IS_SENDING);
+
+                    // [버그1 수정] 중재 패배 = 지금 이 순간 "더 높은 우선순위 노드가 주소 필드를
+                    // 보내는 중"이라는 뜻이고, 그 패킷의 목적지가 나 자신일 수도 있다.
+                    // 그런데 그냥 _rxState=0으로 방치하면 이 패킷의 남은 부분(주소 뒷부분/SRC/LEN/DATA)을
+                    // 통째로 놓쳐버린다. 지금까지 비교를 통과한(=충돌 안 난) 청크들은 전부
+                    // "내가 보낸 값 == 실제 버스 값"이었다는 뜻이므로, 내가 보내려 했던 원본 주소값을
+                    // 그대로 재사용해서 복원할 수 있다. 단, 지금 막 충돌이 감지된 이 청크 하나만은
+                    // 방금 읽은 busVal이 진짜 값이므로 그걸로 교체한다.
+                    {
+                        uint16_t myOriginal = ((uint16_t)_txDestId << 8) | _nodeId; // 내가 보내려던 16비트 주소(destId<<8 | srcId)
+                        uint8_t doneBits = _arbChunksSent * DATA_WIDTH; // 지금까지(이 청크 포함) 확정된 비트 수
+                        // myOriginal의 상위 doneBits비트를 오른쪽 정렬로 뽑아낸 뒤, 마지막 청크(현재 충돌한 것)만
+                        // busVal로 교정 -> "지금까지 실제로 오간 값" 그대로 복원됨 (accumulator가 원래
+                        // 왼쪽시프트+OR로 채워나가는 것과 동일한 오른쪽 정렬 방식)
+                        uint16_t known = myOriginal >> (16 - doneBits);
+                        known = (uint16_t)(known & ~(uint16_t)DATA_MASK) | busVal;
+
+                        if (doneBits <= 8) {
+                            // 아직 destId 필드 진행 중(또는 막 끝난 시점)
+                            _rxAddrByte = (uint8_t)known;
+                            uint8_t remain = (8 - doneBits) / DATA_WIDTH;
+                            if (remain == 0) {
+                                // destId 필드가 이 청크로 끝남 -> RX_ADDR 완료 처리를 그대로 이어서 수행
+                                uint8_t addr7 = _rxAddrByte & SWP2P_NODE_MASK;
+                                bool isBurst = (_rxAddrByte & SWP2P_BURST_BIT) != 0;
+                                if (isBurst) SET_FLAG(FLAG_RX_IS_BURST); else CLR_FLAG(FLAG_RX_IS_BURST);
+                                if (addr7 == _nodeId || addr7 == SWP2P_BROADCAST) SET_FLAG(FLAG_IS_MY_PACKET);
+                                else CLR_FLAG(FLAG_IS_MY_PACKET);
+                                _rxSrcByte = 0;
+                                _rxChunkCount = ARB_CYCLES;
+                                _rxState = 2; // RX_SRC
+                            } else {
+                                _rxChunkCount = remain;
+                                _rxState = 1; // RX_ADDR (이어서 계속)
+                            }
+                        } else {
+                            // 이미 srcId 필드로 넘어간 시점 -> destId는 이미 전부 확정됨(=내가 보내려던 destId 그대로,
+                            // 여기까지 충돌이 없었다는 것 자체가 그 증거)
+                            uint8_t addr7 = _txDestId & SWP2P_NODE_MASK;
+                            bool isBurst = (_txDestId & SWP2P_BURST_BIT) != 0;
+                            if (isBurst) SET_FLAG(FLAG_RX_IS_BURST); else CLR_FLAG(FLAG_RX_IS_BURST);
+                            if (addr7 == _nodeId || addr7 == SWP2P_BROADCAST) SET_FLAG(FLAG_IS_MY_PACKET);
+                            else CLR_FLAG(FLAG_IS_MY_PACKET);
+
+                            uint8_t srcDoneBits = doneBits - 8;
+                            _rxSrcByte = (uint8_t)(known & (((uint16_t)1 << srcDoneBits) - 1));
+                            uint8_t remain = (8 - srcDoneBits) / DATA_WIDTH;
+                            if (remain == 0) {
+                                // srcId까지 이 청크로 끝남 -> RX_SRC 완료 처리를 그대로 이어서 수행
+                                if (GET_FLAG(FLAG_RX_IS_BURST)) {
+                                    _rxDataByte = 0; _rxChunkCount = ARB_CYCLES; _rxState = 3; // RX_LEN
+                                } else {
+                                    _rxDataByte = 0; _rxChunkCount = ARB_CYCLES; _rxLen = 1; _rxByteIdx = 0; _rxState = 4; // RX_DATA
+                                }
+                            } else {
+                                _rxChunkCount = remain;
+                                _rxState = 2; // RX_SRC (이어서 계속)
+                            }
+                        }
+                    }
+
                     _txState = 6; // TX_LOST
                 }
                 return;
             }
-            if (_txState != 0) return;
+            // [버그1 수정] TX_LOST(6) 상태에서도 RX 처리는 계속 흘러가야 한다 (원래는 _txState!=0이면
+            // 무조건 return이라 TX_LOST 동안 RX 상태머신이 완전히 멈춰서 승자의 패킷을 못 받았음).
+            if (_txState != 0 && _txState != 6) return;
 
             uint8_t rxState = _rxState;
 
@@ -491,7 +605,7 @@ public:
                 uint8_t chunkCnt = _rxChunkCount - 1;
                 if (chunkCnt == 0) {
                     if (GET_FLAG(FLAG_IS_MY_PACKET)) {
-                        _fifoPush(dataByte);
+                        _fifoPush(dataByte, _rxSrcByte); // [발신자 ID 수정] RX_SRC 단계에서 이미 확정된 발신자 ID를 데이터와 함께 큐에 넣음
                         SET_FLAG(FLAG_RX_CAPTURED);
                     }
                     _rxByteIdx++;
@@ -551,8 +665,13 @@ public:
                     _rxState = 4; // RX_DATA
                 }
             } else if (rxState == 5) { // RX_ACK
-                PORTB &= ~(1 << PORTB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 LOW)
-                DDRB |= (1 << DDB0);     // [xxxx xxxx] |= [0000 0001] => [xxxx xxx1] (PB0 ACK 응답 구동)
+                // [버그4 전제 수정] 원래는 addressing 여부와 무관하게 무조건 ACK를 쏴서,
+                // 모든 리슨 노드가 매 패킷마다 ACK를 구동했음(= ACK가 "내가 받았다"는 증거로 쓸모없었음).
+                // 실제 목적지였던 노드만 ACK를 구동하도록 게이트.
+                if (GET_FLAG(FLAG_IS_MY_PACKET)) {
+                    PORTB &= ~(1 << PORTB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 LOW)
+                    DDRB |= (1 << DDB0);     // [xxxx xxxx] |= [0000 0001] => [xxxx xxx1] (PB0 ACK 응답 구동)
+                }
                 _rxState = 0;
             }
         }

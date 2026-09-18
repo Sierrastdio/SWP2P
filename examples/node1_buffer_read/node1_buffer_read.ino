@@ -27,7 +27,7 @@ void setup() {
     pinMode(INPUT_PIN, INPUT);
 
     // Start as CLK Master node (50kHz)
-    p2p.begin(true, 50000UL);
+    p2p.begin(true, 48000UL);
 
     Serial.println(F("[Node 1] Digital Pin 10 Input Stream Sender Initialized (5s Interval)"));
 }
