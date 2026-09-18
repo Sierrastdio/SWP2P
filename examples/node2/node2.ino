@@ -28,10 +28,17 @@ void loop() {
     // check for received data
     if (p2p.available()) {
 
-        uint8_t rxData = p2p.read();
+        uint8_t rxData = 0;
+        uint8_t source_Id = 0;
 
-        Serial.print(F("[RX] Got Data from Bus -> 0x"));
-        Serial.println(rxData, HEX);
+        if (p2p.read(rxData, source_Id)) {
 
+            Serial.print(F("[RX] Got Data from Node 0x"));
+            if (source_Id < 0x10) Serial.print(F("0"));
+            Serial.print(source_Id, HEX);
+            Serial.print(F(" -> 0x"));
+            Serial.println(rxData, HEX);
+
+        }
     }
 }

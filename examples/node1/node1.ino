@@ -14,6 +14,7 @@ SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // must be same as node's PRESET
 
 unsigned long lastSendTime = 0;
 uint8_t txCounter = 0;
+bool waitingAck = false;
 
 void setup() {
 
@@ -42,6 +43,7 @@ void loop() {
 
                 Serial.print(F("[TX] Sent to 0x02 -> Data: 0x"));
                 Serial.println(payload, HEX);
+                waitingAck = true;
 
             } else {
 
@@ -51,13 +53,36 @@ void loop() {
         }
     }
 
+    // check ACK result after transmission complete
+    if (waitingAck && !p2p.isSending()) {
+
+        waitingAck = false;
+
+        if (p2p.isAckFailed()) {
+
+            Serial.println(F("[ACK Result] ACK Failed (Timeout / No response)"));
+
+        } else {
+
+            Serial.println(F("[ACK Result] ACK Received Successfully!"));
+
+        }
+    }
+
     // check for received data
     if (p2p.available()) {
 
-        uint8_t rxData = p2p.read();
+        uint8_t rxData = 0;
+        uint8_t srcId = 0;
 
-        Serial.print(F("[RX] Received -> 0x"));
-        Serial.println(rxData, HEX);
+        if (p2p.read(rxData, srcId)) {
 
+            Serial.print(F("[RX] Received from 0x"));
+            if (srcId < 0x10) Serial.print(F("0"));
+            Serial.print(srcId, HEX);
+            Serial.print(F(" -> Data: 0x"));
+            Serial.println(rxData, HEX);
+
+        }
     }
 }

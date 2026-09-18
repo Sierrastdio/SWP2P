@@ -4,7 +4,6 @@
  * ----------------------------------------------------------------------------------------------------------
  */
 
-
 #include <Arduino.h>
 #include "SWP2P.h"
 #include "SWP2PBuffer.h"
@@ -26,12 +25,11 @@ void setup() {
     // Set digital pin 10 as input
     pinMode(INPUT_PIN, INPUT);
 
-    // Start as CLK Master node (50kHz)
+    // Start as CLK Master node (48kHz)
     p2p.begin(true, 48000UL);
 
     Serial.println(F("[Node 1] Digital Pin 10 Input Stream Sender Initialized (5s Interval)"));
 }
-
 
 void loop() {
     // 1. Read digital pin 10 signal and detect rising edge (LOW -> HIGH)
@@ -60,6 +58,9 @@ void loop() {
 
     // 2. Periodic transmission (Every 5s, send data if present and clear the buffer)
     static unsigned long lastTxTime = 0;
+    static bool waitingAck = false; // ACK 결과 대기 상태 플래그
+
+    // 전송 요청 및 결과 처리
     if (millis() - lastTxTime >= 5000) { // 5000ms = 5 seconds
         lastTxTime = millis();
 
@@ -72,11 +73,22 @@ void loop() {
 
             if (ok) {
                 Serial.println(F("Burst packet queued successfully!"));
-                // Clear buffer after successful transmission for next data collection
                 p2p.buffFree(myBuf);
+                waitingAck = true; // 전송 시작 시 ACK 체크 대기
             } else {
-                Serial.println(F("Failed to send burst packet."));
+                Serial.println(F("Failed to send burst packet (Bus busy or driver error)."));
             }
+        }
+    }
+
+    // 전송 완료 후 ACK 수신 여부 확인
+    if (waitingAck && !p2p.isSending()) {
+        waitingAck = false; // 체크 완료 후 대기 해제
+
+        if (p2p.isAckFailed()) {
+            Serial.println(F("[ACK Result] ACK Failed (Timeout / No response from Receiver)"));
+        } else {
+            Serial.println(F("[ACK Result] ACK Received Successfully from Receiver!"));
         }
     }
 }

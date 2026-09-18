@@ -4,7 +4,6 @@
  * -------------------------------------------------------------------------------------------------
  */
 
-
 #include <Arduino.h>
 #include "SWP2P.h"
 #include "SWP2PBuffer.h"
@@ -12,7 +11,6 @@
 // Set up 4-bit data line preset (D4~D7) and Node ID 0x02
 SWP2P<PRESET_W4_D4_D7> p2p(0x02);
 SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // must be same as node's PRESET
-
 
 void setup() {
     Serial.begin(115200);
@@ -42,13 +40,20 @@ void loop() {
             delayMicroseconds(200);
         }
 
-        // Read the full completed packet at once
+        // Read the full completed packet at once (Data and Source ID)
         uint8_t rxBuffer[SWP2P_MAX_BURST];
         uint8_t rxSrcBuffer[SWP2P_MAX_BURST];
         uint8_t receivedLen = p2p.readBytes(rxBuffer, rxSrcBuffer, SWP2P_MAX_BURST);
 
         if (receivedLen > 0) {
-            Serial.print(F("[RX Data Received] -> Hex: "));
+            // 모든 패킷 바이트의 발신자 ID는 동일하므로 첫 번째 바이트의 발신자 ID를 출력[cite: 2]
+            uint8_t srcId = rxSrcBuffer[0];
+
+            Serial.print(F("[RX Data Received] From Sender (ID: 0x"));
+            if (srcId < 0x10) Serial.print(F("0"));
+            Serial.print(srcId, HEX);
+            Serial.print(F(") -> Hex: "));
+
             for (uint8_t i = 0; i < receivedLen; i++) {
                 if (rxBuffer[i] < 0x10) Serial.print(F("0"));
                 Serial.print(rxBuffer[i], HEX);

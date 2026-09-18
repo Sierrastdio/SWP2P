@@ -27,35 +27,43 @@ void loop() {
         delayMicroseconds(500);
 
         uint8_t rxBuffer[SWP2P_MAX_BURST];
+        uint8_t rxSrcBuffer[SWP2P_MAX_BURST];
 
-        // FIFO 버퍼에 쌓인 전체 패킷 바이트를 한 번에 흡수
-        uint8_t receivedLen = p2p.readBytes(rxBuffer, SWP2P_MAX_BURST);
+        // FIFO 버퍼에 쌓인 전체 패킷 바이트와 발신자 ID를 한 번에 흡수
+        uint8_t receivedLen = p2p.readBytes(rxBuffer, rxSrcBuffer, SWP2P_MAX_BURST);
 
-        Serial.print(F("[RX Burst] Received "));
-        Serial.print(receivedLen);
-        Serial.println(F(" Bytes:"));
+        if (receivedLen > 0) {
+            uint8_t srcId = rxSrcBuffer[0];
 
-        // 2. 수신받은 바이트 데이터 HEX 출력
-        Serial.print(F("  -> Raw Data (HEX): "));
-        for (uint8_t i = 0; i < receivedLen; i++) {
-            Serial.print(F("0x"));
-            if (rxBuffer[i] < 0x10) Serial.print(F("0"));
-            Serial.print(rxBuffer[i], HEX);
-            Serial.print(F(" "));
-        }
-        Serial.println();
+            Serial.print(F("[RX Burst] Received "));
+            Serial.print(receivedLen);
+            Serial.print(F(" Bytes from Node 0x"));
+            if (srcId < 0x10) Serial.print(F("0"));
+            Serial.print(srcId, HEX);
+            Serial.println(F(":"));
 
-        // 3. 패킹되어 들어온 8비트 데이터를 1비트 단위로 언패킹 출력
-        Serial.print(F("  -> Stream Bit Value: "));
-        for (uint8_t i = 0; i < receivedLen; i++) {
-            uint8_t currentByte = rxBuffer[i];
-
-            for (int8_t bitIdx = 7; bitIdx >= 0; bitIdx--) {
-                uint8_t bitVal = (currentByte >> bitIdx) & 0x01;
-                Serial.print(bitVal);
+            // 2. 수신받은 바이트 데이터 HEX 출력
+            Serial.print(F("  -> Raw Data (HEX): "));
+            for (uint8_t i = 0; i < receivedLen; i++) {
+                Serial.print(F("0x"));
+                if (rxBuffer[i] < 0x10) Serial.print(F("0"));
+                Serial.print(rxBuffer[i], HEX);
+                Serial.print(F(" "));
             }
-            Serial.print(F(" "));
+            Serial.println();
+
+            // 3. 패킹되어 들어온 8비트 데이터를 1비트 단위로 언패킹 출력
+            Serial.print(F("  -> Stream Bit Value: "));
+            for (uint8_t i = 0; i < receivedLen; i++) {
+                uint8_t currentByte = rxBuffer[i];
+
+                for (int8_t bitIdx = 7; bitIdx >= 0; bitIdx--) {
+                    uint8_t bitVal = (currentByte >> bitIdx) & 0x01;
+                    Serial.print(bitVal);
+                }
+                Serial.print(F(" "));
+            }
+            Serial.println(F("\n--------------------------------------------------"));
         }
-        Serial.println(F("\n--------------------------------------------------"));
     }
 }

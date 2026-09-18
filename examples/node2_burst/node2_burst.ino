@@ -25,16 +25,24 @@ void setup() {
 void loop() {
     // 수신 FIFO에 데이터가 들어왔는지 확인
     if (p2p.available()) {
-        Serial.print(F("[RX Data Received] -> Hex: "));
+        uint8_t rxBuffer[SWP2P_MAX_BURST];
+        uint8_t rxSrcBuffer[SWP2P_MAX_BURST];
+        uint8_t receivedLen = p2p.readBytes(rxBuffer, rxSrcBuffer, SWP2P_MAX_BURST);
 
-        // FIFO에 쌓인 모든 데이터 읽기
-        while (p2p.available()) {
-            uint8_t rxByte = p2p.read();
+        if (receivedLen > 0) {
+            uint8_t srcId = rxSrcBuffer[0];
 
-            if (rxByte < 0x10) Serial.print(F("0"));
-            Serial.print(rxByte, HEX);
-            Serial.print(F(" "));
+            Serial.print(F("[RX Data Received] From Sender (ID: 0x"));
+            if (srcId < 0x10) Serial.print(F("0"));
+            Serial.print(srcId, HEX);
+            Serial.print(F(") -> Hex: "));
+
+            for (uint8_t i = 0; i < receivedLen; i++) {
+                if (rxBuffer[i] < 0x10) Serial.print(F("0"));
+                Serial.print(rxBuffer[i], HEX);
+                Serial.print(F(" "));
+            }
+            Serial.println();
         }
-        Serial.println();
     }
 }

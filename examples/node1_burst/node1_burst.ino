@@ -15,6 +15,7 @@ SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // must be same as node's PRESET
 
 // create buffer to hold burst data (16 bytes)
 SWP2PBuffer<16> myBuf;
+bool waitingAck = false;
 
 void setup() {
     Serial.begin(115200);
@@ -60,9 +61,21 @@ void loop() {
 
             if (ok) {
                 Serial.println(F("4-Bit Burst packet queued successfully!"));
+                waitingAck = true;
             } else {
                 Serial.println(F("Failed to send burst packet."));
             }
+        }
+    }
+
+    // check ACK result after transmission complete
+    if (waitingAck && !p2p.isSending()) {
+        waitingAck = false;
+
+        if (p2p.isAckFailed()) {
+            Serial.println(F("[ACK Result] ACK Failed (Timeout / No response)"));
+        } else {
+            Serial.println(F("[ACK Result] ACK Received Successfully!"));
         }
     }
 }

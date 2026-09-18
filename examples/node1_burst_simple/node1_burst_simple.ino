@@ -12,6 +12,7 @@ SWP2P_BIND_ISRS(PRESET_W4_D4_D7);   // must be same as node's PRESET
 
 unsigned long lastSendTime = 0;
 uint16_t packetCounter = 0;
+bool waitingAck = false;
 
 void setup() {
     Serial.begin(115200);
@@ -42,9 +43,21 @@ void loop() {
             if (p2p.sendBurst(0x02, txPayload, 4)) {
                 Serial.print(F("[TX Burst] Sent 4 Bytes to Node 0x02 -> Count: "));
                 Serial.println(packetCounter);
+                waitingAck = true;
             } else {
                 Serial.println(F("[TX Burst] Send Failed (Buffer or Bus Error)"));
             }
+        }
+    }
+
+    // check ACK result after transmission complete
+    if (waitingAck && !p2p.isSending()) {
+        waitingAck = false;
+
+        if (p2p.isAckFailed()) {
+            Serial.println(F("[ACK Result] ACK Failed (Timeout / No response)"));
+        } else {
+            Serial.println(F("[ACK Result] ACK Received Successfully!"));
         }
     }
 }
