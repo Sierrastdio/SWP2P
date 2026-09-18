@@ -29,7 +29,7 @@ Data lines are always driven open-drain (pull-up resistors required). For each `
 
 ## Installation
 
-Copy `SWP2P.h`, `SWP2P.cpp`, and `SWP2PBuffer.h` into a `libraries/SWP2P/` folder in your sketchbook, then `#include "SWP2P.h"` from the Arduino IDE (or arduino-cli).
+Copy `SWP2P.h`, `SWP2P.cpp`, `SWP2Ppreset.h`, `SWP2Pbuffer.h` into a `Arduino/libraries/SWP2P/` folder in your sketchbook, then `#include "SWP2P.h"` from the Arduino IDE.
 
 ## Quick Start
 
@@ -208,7 +208,7 @@ SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 �
 
 ## 설치
 
-`SWP2P.h`, `SWP2P.cpp`, `SWP2PBuffer.h` 세 파일을 스케치북의 `libraries/SWP2P/` 폴더에 넣고 아두이노 IDE(또는 arduino-cli)에서 `#include "SWP2P.h"`로 사용합니다.
+`SWP2P.h`, `SWP2P.cpp`, `SWP2Ppreset.h`, `SWP2Pbuffer.h` 세 파일을 `Arduino/libraries/SWP2P/` 폴더에 넣고 아두이노 IDE에서 `#include "SWP2P.h"`로 사용합니다.
 
 ## 빠른 시작
 
