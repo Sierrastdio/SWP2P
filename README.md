@@ -8,10 +8,12 @@ SWP2P lets nodes talk to each other directly, without any node acting as a bus m
 
 - **Masterless architecture**: One node may drive the CLK line, but that node does not act as a bus master. All nodes participate in send/receive as equals.
 - **Configurable data width**: Choose 1/2/4/8 data lines (`DataPreset`). More lines means more bits per clock edge and higher throughput.
-- **CLK/BUSY_N/ACK_N based protocol**: Only a minimal set of control lines (BUSY_N, ACK_N) is needed, supporting roughly 10 nodes on the bus by design.
-- **Bit-level arbitration**: The 2-byte destination + source address is driven open-drain and read back on the falling edge for comparison; on a collision the losing node yields automatically (TX_LOST → auto-retry).
+- **CLK/BUSY/ACK based protocol**: Only a minimal set of control lines (BUSY, ACK) is needed, supporting roughly 10 nodes on the bus by design.
+- **Bit-level arbitration**: The 2-byte destination + source address is driven open-drain and read back on the falling edge for comparison; on a collision the losing node yields automatically (`TX_LOST` → auto-retry once the bus goes idle). The losing node also reconstructs the address bits it already sent so it doesn't miss the winner's packet if that packet happens to be addressed to it.
 - **Single-byte and burst transfers**: `send()` uses the original fast path (no LEN field); `sendBurst()` adds a LEN field to transfer multiple bytes in one frame.
-- **Interrupt-driven, non-blocking**: Uses INT0 (CLK), INT1 (BUSY_N), PCINT0 (ACK_N), and Timer1 (automatic CLK output) to minimize CPU overhead.
+- **Real ACK with timeout**: The sender doesn't declare success just because it finished driving data — it waits for the addressed receiver to actively drive the ACK line low, with a bounded timeout (`isAckFailed()` reports failed transfers).
+- **Sender ID delivered with every received byte**: The RX FIFO stores a source-ID alongside each data byte, so a node reading from multiple peers can tell them apart.
+- **Interrupt-driven, non-blocking**: Uses INT0 (CLK), INT1 (BUSY), and Timer1 Input Capture (ACK edge detection), plus Timer1 output-compare for automatic CLK generation, to minimize CPU overhead. ISRs are bound at compile time via a macro (no function-pointer indirection).
 - **RX FIFO + user-friendly buffer API**: `SWP2PBuffer<CAP>` lets you accumulate data bit-by-bit or byte-by-byte, then send it whole or as a sub-range.
 
 ## Hardware Layout
@@ -19,8 +21,8 @@ SWP2P lets nodes talk to each other directly, without any node acting as a bus m
 | Signal | Pin (default) | Description |
 |---|---|---|
 | CLK | D2 (INT0) | Communication clock. Driven by one node (not a master) or an external clock source |
-| BUSY_N | D3 (INT1) | Bus-busy indicator |
-| ACK_N | D8 (PCINT0) | Receive acknowledgment |
+| BUSY | D3 (INT1) | Bus-busy indicator. Watched on both edges (any logical change) so the idle transition is never missed |
+| ACK | D8 / PB0 (Timer1 Input Capture, ICP1) | Actively driven low by the addressed receiver to confirm reception |
 | Data line(s) | D4–D7 / D9,D10 / A0–A3, etc., depending on preset | Selected via `DataPreset` |
 
 Data lines are always driven open-drain (pull-up resistors required). For each `DataPreset`, `_driveDataChunk` / `_readDataChunk` / `_dataRelease` are specialized at compile time (`if constexpr`) and fully inlined.
@@ -37,6 +39,9 @@ Copy `SWP2P.h`, `SWP2P.cpp`, and `SWP2PBuffer.h` into a `libraries/SWP2P/` folde
 // Node using 1 data line (D4), node ID = 1
 SWP2P<PRESET_W1_D4> node(1);
 
+// Bind the ISRs for this preset (do this exactly once, at file scope)
+SWP2P_BIND_ISRS(PRESET_W1_D4);
+
 void setup() {
     // Whether this node drives CLK, and the clock frequency (Hz)
     node.begin(true, 1000UL);
@@ -47,9 +52,9 @@ void loop() {
     node.send(2, 0x42);
 
     // Check for received data
-    if (node.available()) {
-        uint8_t v = node.read();
-        // ...
+    uint8_t data, srcId;
+    if (node.read(data, srcId)) {
+        // data came from node `srcId`
     }
 }
 ```
@@ -61,10 +66,14 @@ void loop() {
 ```cpp
 SWP2P<DataPreset> node(uint8_t nodeId);
 void node.begin(bool clkIsOutput, unsigned long clkFreq = 100000UL);
+
+// Once per preset, at file scope (not inside a function):
+SWP2P_BIND_ISRS(DataPreset);
 ```
 
 - `nodeId` is masked to 7 bits (0–126). `0x7F` (127) is reserved as the broadcast address.
 - If `clkIsOutput = true`, this node automatically drives CLK using Timer1.
+- `SWP2P_BIND_ISRS(preset)` expands to the `ISR(INT0_vect)`, `ISR(INT1_vect)`, and `ISR(TIMER1_CAPT_vect)` definitions bound to that specific `SWP2P<preset>` specialization. Call it exactly once for whichever preset you actually use.
 
 ### Sending
 
@@ -77,25 +86,30 @@ bool node.sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len);
 - `sendBurst()` automatically sets the burst flag (MSB of the destination byte) when `len > 1`, and transmits an additional LEN field (encoded as `len - 2`). `len` must be between 1 and `SWP2P_MAX_BURST` (default 16, can be increased if needed).
 - Returns `false` if a transfer is already in progress (`isSending()`) or the bus is busy (`isBusy()`).
 - Use `SWP2P<PRESET>::BROADCAST` as `destId` to broadcast to all nodes.
+- A send only completes successfully once the addressed receiver actively acknowledges it (see **Status checks** / `isAckFailed()`).
 
 ### Receiving
 
 ```cpp
 bool node.available();
-uint8_t node.read();
-uint8_t node.readBytes(uint8_t* outBuf, uint8_t maxLen);
-uint8_t node.peek();
+bool node.read(uint8_t& data, uint8_t& srcId);
+uint8_t node.readBytes(uint8_t* outBuf, uint8_t* srcBuf, uint8_t maxLen);
+bool node.peek(uint8_t& data, uint8_t& srcId);
 void node.flush();
 ```
 
-Received data is queued in an internal FIFO (`SWP2P_FIFO_DEPTH`, default 16, must be a power of 2). Only packets addressed to this node (or broadcast packets) are captured into the FIFO.
+- `read()` / `peek()` always return both the data byte and the sender's node ID together — `outBuf[i]` and `srcBuf[i]` in `readBytes()` correspond 1:1, since consecutive queued bytes may come from different senders.
+- Received data is queued in an internal FIFO (`SWP2P_FIFO_DEPTH`, default 16, must be a power of 2). Only packets addressed to this node (or broadcast packets) are captured into the FIFO.
 
 ### Status checks
 
 ```cpp
 bool node.isSending();
 bool node.isBusy();
+bool node.isAckFailed();
 ```
+
+- `isAckFailed()` reports whether the most recent `send()`/`sendBurst()` timed out waiting for the receiver's ACK. Reading it clears the flag, so check it right after a send whose result you care about.
 
 ### Buffer API (`SWP2PBuffer<CAP>`)
 
@@ -139,29 +153,28 @@ A wider data width carries more bits per clock edge, reducing the number of tran
 
 ## Protocol Overview
 
-1. **ARB (Arbitration)**: On each rising CLK edge, 2 bytes — `dest` (MSB = burst flag) and `src` — are driven open-drain, and read back on the falling edge for comparison. If the bus value indicates another node is driving a higher-priority (more "0"-heavy) value, this node immediately yields, enters the `TX_LOST` state, and automatically retries once BUSY_N returns to idle.
+1. **ARB (Arbitration)**: On each rising CLK edge, 2 bytes — `dest` (MSB = burst flag) and `src` — are driven open-drain, and read back on the falling edge for comparison. If the bus value indicates another node is driving a higher-priority (more "0"-heavy) value, this node immediately yields, enters the `TX_LOST` state, and automatically retries once BUSY returns to idle. While in `TX_LOST`, the node keeps tracking the winner's packet on the RX side instead of going silent, in case that packet is addressed to it.
 2. **LEN (burst frames only)**: The value `len - 2` is encoded and transmitted (this step is skipped for single-byte transfers).
 3. **DATA**: 1 byte (single transfer) or `len` bytes (burst) are transmitted in sequence.
-4. **RELEASE/ACK**: The sender releases the data line(s) and finishes; the receiver confirms reception via ACK_N.
+4. **ACK**: The sender releases the data line(s) but keeps BUSY asserted while it waits a bounded number of clock edges for the addressed receiver to drive ACK low. If the ACK arrives in time, the send is marked successful; otherwise it times out and `isAckFailed()` will report `true` on the next check. Either way, BUSY is released once the wait ends so other nodes can use the bus.
 
-Receiving nodes only capture packets addressed to them (or broadcast packets) into the FIFO; other packets are tracked for line-state purposes only and otherwise ignored.
+Receiving nodes only capture packets addressed to them (or broadcast packets) into the FIFO, and only the addressed receiver drives ACK; other packets/nodes are tracked for line-state purposes only and otherwise ignored.
 
 ## Design Constraints / Notes
 
 - Data lines must be open-drain with pull-up resistors — testing confirmed that communication is impossible without pull-ups.
 - Node IDs are limited to 0–126; 127 (`SWP2P_BROADCAST`) is reserved for broadcast.
-- Increasing `SWP2P_MAX_BURST` (default 16) allows burst transfers of up to 257 bytes in theory, but increases RAM usage accordingly.
+- Increasing `SWP2P_MAX_BURST` (default 16) allows burst transfers of up to 257 bytes in theory, but increases RAM usage accordingly. Note that a `SWP2PBuffer<CAP>` with `CAP` larger than `SWP2P_MAX_BURST` will fail to compile (`static_assert`); it is not automatically split into multiple frames.
 - The maximum usable clock frequency depends on your environment (pull-up resistor values, wiring, WIDTH setting); measuring and tuning it empirically is recommended.
 
 ## File Overview
 
-- `SWP2P.h` — `SWP2PBase` (shared static state) + `SWP2P<DataPreset>` template class (compile-time specialization per pin configuration)
-- `SWP2P.cpp` — static member definitions, Timer1 setup, ISR (INT0/INT1/PCINT0) bridges
+- `SWP2P.h` — `SWP2PBase` (shared static state) + `SWP2P<DataPreset>` template class (compile-time specialization per pin configuration) + `SWP2P_BIND_ISRS` macro
+- `SWP2P.cpp` — static member definitions, Timer1 setup/teardown, shared FIFO push logic
 - `SWP2PBuffer.h` — user-friendly buffer template class for accumulating data bit-by-bit or byte-by-byte
 
 
 ***
-
 
 
 # SWP2P (Software Peer-to-Peer)
@@ -174,10 +187,12 @@ SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 �
 
 - **마스터 없는 구조**: CLK을 출력하는 노드가 있을 수는 있지만, 그 노드가 버스의 주인(마스터) 역할을 하지 않습니다. 모든 노드가 대등하게 송수신에 참여합니다.
 - **가변 데이터 폭**: 데이터선을 1/2/4/8개 중에서 선택할 수 있습니다 (`DataPreset`). 선 개수가 늘어날수록 사이클당 더 많은 비트를 실어 전송 속도를 높일 수 있습니다.
-- **CLK/BUSY_N/ACK_N 3선 기반 프로토콜**: 최소한의 제어선(BUSY_N, ACK_N)만으로 다수 노드(설계 목표 약 10개) 연결을 지원합니다.
-- **비트 단위 중재(arbitration)**: 목적지 주소(dest) + 발신자 주소(src) 2바이트를 open-drain 방식으로 실어 보내고, 되읽기(readback) 비교를 통해 충돌 시 자동으로 양보(TX_LOST → 재시도)합니다.
+- **CLK/BUSY/ACK 3선 기반 프로토콜**: 최소한의 제어선(BUSY, ACK)만으로 다수 노드(설계 목표 약 10개) 연결을 지원합니다.
+- **비트 단위 중재(arbitration)**: 목적지 주소(dest) + 발신자 주소(src) 2바이트를 open-drain 방식으로 실어 보내고, 되읽기(readback) 비교를 통해 충돌 시 자동으로 양보(`TX_LOST` → 버스가 idle로 돌아오면 자동 재시도)합니다. 패배한 노드는 자신이 이미 보낸 주소 비트를 복원해두어, 승자의 패킷이 자신에게 온 것이더라도 놓치지 않습니다.
 - **단일 바이트 / 버스트 전송 모두 지원**: `send()`는 기존 빠른 경로를 그대로 사용하고, `sendBurst()`는 길이(LEN) 필드를 추가로 실어 여러 바이트를 한 번에 전송합니다.
-- **인터럽트 기반, 논블로킹**: INT0(CLK), INT1(BUSY_N), PCINT0(ACK_N)과 Timer1(CLK 자동 출력)을 활용해 CPU 부담을 최소화합니다.
+- **실제 ACK 확인 + 타임아웃**: 데이터를 다 보냈다고 곧바로 성공 처리하지 않고, 목적지 노드가 실제로 ACK 라인을 LOW로 구동하는지 제한된 시간 동안 기다립니다(`isAckFailed()`로 실패 여부 조회 가능).
+- **수신 바이트마다 발신자 ID 동반 제공**: RX FIFO에 데이터 바이트와 발신자 ID가 함께 쌓여, 여러 상대와 통신하는 노드도 출처를 구분할 수 있습니다.
+- **인터럽트 기반, 논블로킹**: INT0(CLK), INT1(BUSY), Timer1 Input Capture(ACK 엣지 감지), Timer1 출력비교(CLK 자동 출력)를 활용해 CPU 부담을 최소화합니다. ISR은 함수 포인터 간접호출 없이 매크로를 통해 컴파일타임에 바인딩됩니다.
 - **수신 FIFO + 사용자 친화 버퍼 API**: `SWP2PBuffer<CAP>`로 비트/바이트 단위로 데이터를 모으고, 그대로 혹은 부분 범위만 잘라서 전송할 수 있습니다.
 
 ## 하드웨어 구성
@@ -185,8 +200,8 @@ SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 �
 | 신호 | 핀 (기본) | 설명 |
 |---|---|---|
 | CLK | D2 (INT0) | 통신 클럭. 한 노드가 출력(마스터 아님) 또는 외부 클럭 |
-| BUSY_N | D3 (INT1) | 버스 점유 여부 |
-| ACK_N | D8 (PCINT0) | 수신 확인 |
+| BUSY | D3 (INT1) | 버스 점유 여부. 양쪽 엣지(Any Logical Change)를 모두 감지해 idle 복귀 시점을 놓치지 않음 |
+| ACK | D8 / PB0 (Timer1 Input Capture, ICP1) | 목적지 노드가 실제로 LOW 구동하여 수신을 확인 |
 | 데이터선 | Preset에 따라 D4~D7 / D9,D10 / A0~A3 등 | `DataPreset`으로 선택 |
 
 데이터선은 항상 open-drain(풀업 필요)으로 구동되며, 각 `DataPreset`에 맞춰 컴파일타임에 `_driveDataChunk` / `_readDataChunk` / `_dataRelease`가 특수화(`if constexpr`)되어 인라인 전개됩니다.
@@ -203,6 +218,9 @@ SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 �
 // 데이터선 1개(D4)를 사용하는 노드, 노드 ID = 1
 SWP2P<PRESET_W1_D4> node(1);
 
+// 이 preset에 대한 ISR 바인딩 (파일 스코프에서 딱 한 번만 호출)
+SWP2P_BIND_ISRS(PRESET_W1_D4);
+
 void setup() {
     // 이 노드가 CLK을 출력할지 여부, 클럭 주파수(Hz)
     node.begin(true, 1000UL);
@@ -213,9 +231,9 @@ void loop() {
     node.send(2, 0x42);
 
     // 수신 확인
-    if (node.available()) {
-        uint8_t v = node.read();
-        // ...
+    uint8_t data, srcId;
+    if (node.read(data, srcId)) {
+        // data는 srcId 노드로부터 온 값
     }
 }
 ```
@@ -227,10 +245,14 @@ void loop() {
 ```cpp
 SWP2P<DataPreset> node(uint8_t nodeId);
 void node.begin(bool clkIsOutput, unsigned long clkFreq = 100000UL);
+
+// 사용하는 preset마다 파일 스코프에서 한 번:
+SWP2P_BIND_ISRS(DataPreset);
 ```
 
 - `nodeId`는 7비트(0~126)로 마스킹되어 저장됩니다. `0x7F`(127)은 브로드캐스트 전용 주소로 예약되어 있습니다.
 - `clkIsOutput = true`이면 Timer1을 이용해 이 노드가 CLK을 자동 출력합니다.
+- `SWP2P_BIND_ISRS(preset)`는 해당 `SWP2P<preset>` 특수화에 바인딩된 `ISR(INT0_vect)`, `ISR(INT1_vect)`, `ISR(TIMER1_CAPT_vect)` 정의로 전개됩니다. 실제 사용하는 preset에 대해 정확히 한 번만 호출하면 됩니다.
 
 ### 전송
 
@@ -243,25 +265,30 @@ bool node.sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len);
 - `sendBurst()`는 `len > 1`일 때 목적지 주소의 MSB에 burst 플래그가 자동으로 세팅되고, LEN 필드(`len-2` 인코딩)가 추가로 전송됩니다. `len`은 1~`SWP2P_MAX_BURST`(기본 16, 필요 시 늘릴 수 있음) 범위여야 합니다.
 - 이미 전송 중이거나(`isSending()`) 버스가 사용 중이면(`isBusy()`) `false`를 반환합니다.
 - `destId`로 `SWP2P<PRESET>::BROADCAST`를 사용하면 모든 노드에 브로드캐스트됩니다.
+- 목적지 노드가 실제로 ACK을 구동해야만 전송이 최종 성공으로 간주됩니다(아래 **상태 확인** / `isAckFailed()` 참고).
 
 ### 수신
 
 ```cpp
 bool node.available();
-uint8_t node.read();
-uint8_t node.readBytes(uint8_t* outBuf, uint8_t maxLen);
-uint8_t node.peek();
+bool node.read(uint8_t& data, uint8_t& srcId);
+uint8_t node.readBytes(uint8_t* outBuf, uint8_t* srcBuf, uint8_t maxLen);
+bool node.peek(uint8_t& data, uint8_t& srcId);
 void node.flush();
 ```
 
-수신 데이터는 내부 FIFO(`SWP2P_FIFO_DEPTH`, 기본 16, 2의 거듭제곱이어야 함)에 쌓이며, 자신에게 보내진 패킷 또는 브로드캐스트 패킷만 FIFO에 들어옵니다.
+- `read()` / `peek()`는 항상 데이터 바이트와 발신자 노드 ID를 함께 반환합니다 — `readBytes()`의 `outBuf[i]`와 `srcBuf[i]`는 1:1로 대응되며, 큐에 쌓인 연속된 바이트라도 발신자가 다를 수 있기 때문입니다.
+- 수신 데이터는 내부 FIFO(`SWP2P_FIFO_DEPTH`, 기본 16, 2의 거듭제곱이어야 함)에 쌓이며, 자신에게 보내진 패킷 또는 브로드캐스트 패킷만 FIFO에 들어옵니다.
 
 ### 상태 확인
 
 ```cpp
 bool node.isSending();
 bool node.isBusy();
+bool node.isAckFailed();
 ```
+
+- `isAckFailed()`는 가장 최근 `send()`/`sendBurst()`가 ACK 타임아웃으로 실패했는지 조회합니다. 조회하는 순간 플래그가 자동으로 클리어되므로, 결과를 확인하고 싶은 전송 직후에 바로 체크하세요.
 
 ### 버퍼 API (`SWP2PBuffer<CAP>`)
 
@@ -305,22 +332,22 @@ node.buffFree(buf, 2);
 
 ## 프로토콜 개요
 
-1. **ARB (중재)**: CLK 상승 에지마다 `dest`(1바이트, MSB=burst 플래그) + `src`(1바이트) 총 2바이트를 open-drain으로 구동하고, 하강 에지에 되읽어 비교합니다. 자신이 구동한 값보다 버스 값이 더 "0"에 가까우면(상대가 더 우선순위 높은 값을 구동 중이면) 즉시 양보하고 `TX_LOST` 상태로 전환, BUSY_N이 idle로 돌아오면 자동 재시도합니다.
+1. **ARB (중재)**: CLK 상승 에지마다 `dest`(1바이트, MSB=burst 플래그) + `src`(1바이트) 총 2바이트를 open-drain으로 구동하고, 하강 에지에 되읽어 비교합니다. 자신이 구동한 값보다 버스 값이 더 "0"에 가까우면(상대가 더 우선순위 높은 값을 구동 중이면) 즉시 양보하고 `TX_LOST` 상태로 전환, BUSY가 idle로 돌아오면 자동 재시도합니다. `TX_LOST` 상태에서도 RX 처리는 멈추지 않고 계속되어, 승자의 패킷이 자신에게 온 것일 경우를 놓치지 않습니다.
 2. **LEN (버스트일 때만)**: `len - 2` 값을 인코딩해 전송합니다(단일 바이트 전송에는 없는 단계).
 3. **DATA**: 1바이트(단일 전송) 또는 `len`바이트(버스트)를 순서대로 전송합니다.
-4. **RELEASE/ACK**: 송신 측은 데이터선을 놓고(release) 종료하며, 수신 측은 ACK_N을 통해 수신을 확인합니다.
+4. **ACK**: 송신 측은 데이터선은 놓아주지만 BUSY는 계속 잡은 채, 목적지 노드가 ACK을 LOW로 구동하는지 제한된 클럭 엣지 수만큼 기다립니다. 제 시간에 ACK이 오면 전송 성공으로 처리되고, 못 받으면 타임아웃되어 다음 조회 시 `isAckFailed()`가 `true`를 반환합니다. 어느 쪽이든 대기가 끝나면 BUSY는 해제되어 다른 노드가 버스를 사용할 수 있습니다.
 
-수신 측은 자신의 주소(또는 브로드캐스트) 패킷만 FIFO에 캡처하고, 그 외 패킷은 라인 상태만 따라가며 무시합니다.
+수신 측은 자신의 주소(또는 브로드캐스트) 패킷만 FIFO에 캡처하고 목적지 노드만 ACK을 구동하며, 그 외 패킷/노드는 라인 상태만 따라가며 무시합니다.
 
 ## 설계상 제약 / 주의사항
 
 - 데이터선은 반드시 풀업 저항이 있는 open-drain 구성이어야 합니다 (풀업이 없으면 통신 자체가 불가능함을 실측으로 확인).
 - 노드 ID는 0~126만 사용 가능하며, 127(`SWP2P_BROADCAST`)은 브로드캐스트 전용입니다.
-- `SWP2P_MAX_BURST`(기본 16)를 늘리면 이론상 최대 257바이트까지 버스트 전송이 가능하지만, RAM 사용량이 함께 증가합니다.
+- `SWP2P_MAX_BURST`(기본 16)를 늘리면 이론상 최대 257바이트까지 버스트 전송이 가능하지만, RAM 사용량이 함께 증가합니다. `SWP2P_MAX_BURST`보다 큰 `CAP`으로 `SWP2PBuffer<CAP>`를 선언하면 컴파일 에러(`static_assert`)가 발생하며, 자동으로 여러 프레임에 나누어 전송되지 않습니다.
 - 클럭 주파수는 사용 환경(풀업 저항값, 배선, WIDTH 설정)에 따라 상한이 달라지므로 실측을 통해 조정하는 것을 권장합니다.
 
 ## 파일 구성
 
-- `SWP2P.h` — `SWP2PBase`(공통 static 상태) + `SWP2P<DataPreset>` 템플릿 클래스(핀 구성별 컴파일타임 특수화)
-- `SWP2P.cpp` — static 멤버 정의, Timer1 설정, ISR(INT0/INT1/PCINT0) 브릿지
+- `SWP2P.h` — `SWP2PBase`(공통 static 상태) + `SWP2P<DataPreset>` 템플릿 클래스(핀 구성별 컴파일타임 특수화) + `SWP2P_BIND_ISRS` 매크로
+- `SWP2P.cpp` — static 멤버 정의, Timer1 설정/정지, 공용 FIFO push 로직
 - `SWP2PBuffer.h` — 비트/바이트 단위로 데이터를 모으는 사용자 친화 버퍼 템플릿 클래스
