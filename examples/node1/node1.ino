@@ -21,7 +21,8 @@ void setup() {
     Serial.begin(115200);
     while (!Serial);
 
-    p2p.begin(true, 48000UL);
+    // Start as CLK Master node
+    p2p.begin(true, 45000UL, 50000UL);
     // 'true' means this node generates Timer1 CTC CLK in D9. false means this node receives CLK from external source (D2).
     // you have to connect D9 to D2 with jumper wire if you set 'true'.
     Serial.println(F("=== SWP2P Node 0x01 Initialized (CLK Generator) ==="));

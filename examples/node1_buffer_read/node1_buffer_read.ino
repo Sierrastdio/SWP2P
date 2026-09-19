@@ -25,8 +25,10 @@ void setup() {
     // Set digital pin 10 as input
     pinMode(INPUT_PIN, INPUT);
 
-    // Start as CLK Master node (48kHz)
-    p2p.begin(true, 48000UL, 60000UL);
+    // Start as CLK Master node
+    p2p.begin(true, 45000UL, 50000UL);
+    // 'true' means this node generates Timer1 CTC CLK in D9. false means this node receives CLK from external source (D2).
+    // you have to connect D9 to D2 with jumper wire if you set 'true'.
 
     Serial.println(F("[Node 1] Digital Pin 10 Input Stream Sender Initialized (5s Interval)"));
 }

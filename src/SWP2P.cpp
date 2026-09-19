@@ -31,25 +31,25 @@ uint8_t SWP2PBase::_txData = 0;
 uint8_t SWP2PBase::_txBuffer[SWP2P_MAX_BURST];
 uint8_t SWP2PBase::_txLen = 0;
 uint8_t SWP2PBase::_txIdx = 0;
-volatile uint16_t SWP2PBase::_txArbReg = 0;
-volatile uint8_t SWP2PBase::_txDataReg = 0;
-volatile uint8_t SWP2PBase::_arbChunkCount = 0;
-volatile uint8_t SWP2PBase::_txDataChunkCount = 0;
-volatile uint8_t SWP2PBase::_arbMyChunk = 0;
-volatile uint8_t SWP2PBase::_arbChunksSent = 0; // [버그1 수정]
-volatile uint8_t SWP2PBase::_ackWaitCount = 0;  // [버그4 수정]
+uint16_t SWP2PBase::_txArbReg = 0;
+uint8_t SWP2PBase::_txDataReg = 0;
+uint8_t SWP2PBase::_arbChunkCount = 0;
+uint8_t SWP2PBase::_txDataChunkCount = 0;
+uint8_t SWP2PBase::_arbMyChunk = 0;
+uint8_t SWP2PBase::_arbChunksSent = 0; // [버그1 수정]
+uint8_t SWP2PBase::_ackWaitCount = 0;  // [버그4 수정]
 
 // ---- Dynamic Clock Scaling ----
 volatile bool SWP2PBase::_isClkMaster = false;
 uint16_t SWP2PBase::_ocrArb = 0;
 uint16_t SWP2PBase::_ocrData = 0;
 
-volatile uint8_t SWP2PBase::_rxAddrByte = 0;
-volatile uint8_t SWP2PBase::_rxSrcByte = 0;
-volatile uint8_t SWP2PBase::_rxDataByte = 0;
-volatile uint8_t SWP2PBase::_rxChunkCount = 0;
-volatile uint8_t SWP2PBase::_rxLen = 0;
-volatile uint8_t SWP2PBase::_rxByteIdx = 0;
+uint8_t SWP2PBase::_rxAddrByte = 0;
+uint8_t SWP2PBase::_rxSrcByte = 0;
+uint8_t SWP2PBase::_rxDataByte = 0;
+uint8_t SWP2PBase::_rxChunkCount = 0;
+uint8_t SWP2PBase::_rxLen = 0;
+uint8_t SWP2PBase::_rxByteIdx = 0;
 
 void SWP2PBase::_fifoPush(uint8_t val, uint8_t srcId) { // [발신자 ID 수정]
     if (_rxCount >= SWP2P_FIFO_DEPTH) return;
@@ -68,9 +68,8 @@ void SWP2PBase::setupTimer1(unsigned long freq) {
     TCNT1  = 0; // 0x0000 : 타이머 카운터 값 0으로 초기화
 
     // CTC 모드 토글 주파수 공식: F_oc1a = F_CPU / (2 * N * (1 + OCR1A))  (단, 분주비 N = 1)
-    // 설정 주파수(freq)에 맞는 OCR1A 비교 일치 값 계산
-    uint16_t ocrValue = (uint16_t)((F_CPU / (2UL * freq)) - 1);
-    OCR1A = ocrValue;
+    // 설정 주파수(freq)에 맞는 OCR1A 비교 일치 값 계산 (_freqToOcr에서 범위 클램프 처리)
+    OCR1A = _freqToOcr(freq);
 
     // COM1A0 = 1 (비트 6 set) -> CTC 비교 일치 발생 시 OC1A(PB1 / Arduino D9) 핀 토글(Toggle)
     // TCCR1A |= (1 << COM1A0) -> 0x40 (0100 0000)

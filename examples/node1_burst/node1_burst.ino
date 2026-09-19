@@ -20,8 +20,10 @@ bool waitingAck = false;
 void setup() {
     Serial.begin(115200);
 
-    // Start as CLK Master node (48kHz)
-    p2p.begin(true, 48000UL);
+    // Start as CLK Master node
+    p2p.begin(true, 45000UL, 50000UL);
+    // 'true' means this node generates Timer1 CTC CLK in D9. false means this node receives CLK from external source (D2).
+    // you have to connect D9 to D2 with jumper wire if you set 'true'.
 
     Serial.println(F("[Node 1] SWP2P 4-Bit Burst Sender Initialized (D4~D7)"));
 }

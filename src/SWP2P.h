@@ -21,8 +21,8 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/atomic.h>
-#include "SWP2Pbuffer.h"
-#include "SWP2Ppreset.h" // DataPreset enum, 프리셋별 핀 조작(_driveDataChunk 등), WIDTH 관련 상수는 전부 여기로 이동됨
+#include "SWP2PBuffer.h"
+#include "SWP2PPreset.h" // DataPreset enum, 프리셋별 핀 조작(_driveDataChunk 등), WIDTH 관련 상수는 전부 여기로 이동됨
 
 #define SWP2P_FIFO_DEPTH 16
 #define SWP2P_MAX_BURST   16  // _txBuffer 크기. len-2를 8비트 레지스터에 실어 보내므로 이론상 257까지 가능하지만
@@ -77,20 +77,24 @@ public:
     static uint8_t _txBuffer[SWP2P_MAX_BURST]; // len>1일 때 사용
     static uint8_t _txLen;
     static uint8_t _txIdx;
-    static volatile uint16_t _txArbReg;
-    static volatile uint8_t _txDataReg;   // 데이터 바이트 전송용 + LEN 필드 전송에도 재사용
-    static volatile uint8_t _arbChunkCount;
-    static volatile uint8_t _txDataChunkCount;
-    static volatile uint8_t _arbMyChunk;
-    static volatile uint8_t _arbChunksSent; // [버그1 수정] 이번 중재 라운드에서 "드라이브+비교까지 끝난" 청크 수(이번 것 포함)
-    static volatile uint8_t _ackWaitCount;  // [버그4 수정] ACK 대기 중 남은 edge 수 (0이면 타임아웃)
+    // [속도 개선] 아래 필드들은 _onClkEdge()/_onBusyEdge()(ISR 브릿지) 안에서만 읽고 쓴다.
+    // send()/read()/isSending() 등 공개 API나 메인 루프가 동시에 건드리는 일이 없으므로
+    // volatile을 뗐다 - volatile이 붙으면 같은 함수 안에서도 매번 SRAM으로 다시 읽고/쓰게
+    // 강제되어(레지스터 캐싱 금지) 에지마다 불필요한 load/store가 늘어난다.
+    static uint16_t _txArbReg;
+    static uint8_t _txDataReg;   // 데이터 바이트 전송용 + LEN 필드 전송에도 재사용
+    static uint8_t _arbChunkCount;
+    static uint8_t _txDataChunkCount;
+    static uint8_t _arbMyChunk;
+    static uint8_t _arbChunksSent; // [버그1 수정] 이번 중재 라운드에서 "드라이브+비교까지 끝난" 청크 수(이번 것 포함)
+    static uint8_t _ackWaitCount;  // [버그4 수정] ACK 대기 중 남은 edge 수 (0이면 타임아웃)
 
-    static volatile uint8_t _rxAddrByte;
-    static volatile uint8_t _rxSrcByte;
-    static volatile uint8_t _rxDataByte;   // 데이터 바이트 수신용 + LEN 필드 수신에도 재사용
-    static volatile uint8_t _rxChunkCount;
-    static volatile uint8_t _rxLen;        // 이번 프레임에서 받아야 할 총 바이트 수
-    static volatile uint8_t _rxByteIdx;    // 지금까지 받은 바이트 수
+    static uint8_t _rxAddrByte;
+    static uint8_t _rxSrcByte;
+    static uint8_t _rxDataByte;   // 데이터 바이트 수신용 + LEN 필드 수신에도 재사용
+    static uint8_t _rxChunkCount;
+    static uint8_t _rxLen;        // 이번 프레임에서 받아야 할 총 바이트 수
+    static uint8_t _rxByteIdx;    // 지금까지 받은 바이트 수
 
     static void _fifoPush(uint8_t val, uint8_t srcId); // [발신자 ID 수정]
     static void setupTimer1(unsigned long freq);
@@ -105,20 +109,33 @@ public:
     static uint16_t _ocrData; // DATA(페이로드) 구간용 고속 OCR1A (실측으로 튜닝해서 넣을 값)
 
     // freq(Hz) -> OCR1A 값 변환. setupTimer1()의 공식과 동일해야 한다(분주비 1 고정 전제).
+    // [버그 수정] OCR1A는 16비트라서 분주비 1 기준 표현 가능한 범위가 있다:
+    //   - 최저 주파수 ≈ F_CPU/(2*65536) (16MHz 기준 약 122Hz) 미만을 넣으면
+    //     (F_CPU/(2*freq))-1 이 65535를 넘어서 uint16_t로 캐스팅될 때 조용히 오버플로우/랩어라운드
+    //     되어 완전히 엉뚱한(훨씬 높은) 주파수가 나간다 - 에러도 안 나고 그냥 틀린 값으로 동작해버림.
+    //   - 반대로 너무 높은 주파수를 넣으면 raw가 0이 되어 -1 시점에 uint16_t 언더플로우(65535)가 난다.
+    // 그래서 여기서 범위를 클램프해 "조용히 틀린 값"이 되는 상황 자체를 차단한다.
     static inline uint16_t _freqToOcr(unsigned long freq) {
-        return (uint16_t)((F_CPU / (2UL * freq)) - 1);
+        if (freq == 0) freq = 1; // 0 나눗셈 방지
+        unsigned long raw = F_CPU / (2UL * freq);
+        if (raw < 1UL) raw = 1UL;         // 표현 가능한 최고 주파수 한계 (OCR1A=0)
+        if (raw > 65536UL) raw = 65536UL; // 표현 가능한 최저 주파수 한계 (OCR1A=65535, 16MHz 기준 약 122Hz)
+        return (uint16_t)(raw - 1UL);
     }
 
     // ARB(중재)가 끝나고 LEN/DATA로 넘어가는 그 순간(=에지 ISR 진입 직후, TCNT1이 막 0으로
-    // 리셋된 시점) 호출한다. CTC 모드에서는 컴페어 매치 직후 TCNT1이 항상 0이므로, 이 타이밍에
-    // OCR1A를 새 값으로 바꿔도 65536까지 한 바퀴 도는 글리치 없이 다음 반주기부터 바로 적용된다.
+    // 리셋된 시점) 호출한다. [강화] 그런데 이 지점까지 도달하는 코드 경로가 짧을 수도(정상
+    // 경로) 길 수도(중재 충돌 핸드오프처럼 계산이 많은 경로) 있어서, ISR 진입 후 여기 도달할
+    // 때까지 이미 TCNT1이 새 OCR1A 값보다 커져 있으면 다음 매치까지 65536카운트를 통째로
+    // 돌아야 하는 수 ms짜리 글리치가 생길 수 있다. TCNT1을 여기서 같이 0으로 리셋해주면
+    // ISR 진입~여기 도달 시간과 무관하게 항상 "지금부터 정확히 새 주기"가 보장된다.
     static inline void _clkGoFast() __attribute__((always_inline)) {
-        if (_isClkMaster) OCR1A = _ocrData;
+        if (_isClkMaster) { OCR1A = _ocrData; TCNT1 = 0; }
     }
     // DATA가 끝나고 ACK/유휴로 돌아가는 순간, 그리고 버스 idle 리셋 시점에 호출해서 항상
-    // ARB에 안전한 저속으로 복귀시킨다.
+    // ARB에 안전한 저속으로 복귀시킨다. (위와 동일한 이유로 TCNT1도 같이 리셋)
     static inline void _clkGoSlow() __attribute__((always_inline)) {
-        if (_isClkMaster) OCR1A = _ocrArb;
+        if (_isClkMaster) { OCR1A = _ocrArb; TCNT1 = 0; }
     }
 };
 
