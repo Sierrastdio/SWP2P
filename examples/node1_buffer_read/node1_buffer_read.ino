@@ -6,7 +6,7 @@
 
 #include <Arduino.h>
 #include "SWP2P.h"
-#include "SWP2PBuffer.h"
+#include "SWP2Pbuffer.h"
 
 #define INPUT_PIN 10
 
@@ -26,7 +26,7 @@ void setup() {
     pinMode(INPUT_PIN, INPUT);
 
     // Start as CLK Master node (48kHz)
-    p2p.begin(true, 48000UL);
+    p2p.begin(true, 48000UL, 60000UL);
 
     Serial.println(F("[Node 1] Digital Pin 10 Input Stream Sender Initialized (5s Interval)"));
 }

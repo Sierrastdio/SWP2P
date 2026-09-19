@@ -21,8 +21,8 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/atomic.h>
-#include "SWP2PBuffer.h"
-#include "SWP2PPreset.h"
+#include "SWP2Pbuffer.h"
+#include "SWP2Ppreset.h" // DataPreset enum, 프리셋별 핀 조작(_driveDataChunk 등), WIDTH 관련 상수는 전부 여기로 이동됨
 
 #define SWP2P_FIFO_DEPTH 16
 #define SWP2P_MAX_BURST   16  // _txBuffer 크기. len-2를 8비트 레지스터에 실어 보내므로 이론상 257까지 가능하지만
@@ -95,6 +95,31 @@ public:
     static void _fifoPush(uint8_t val, uint8_t srcId); // [발신자 ID 수정]
     static void setupTimer1(unsigned long freq);
     static void stopTimer1();
+
+    // ---- Dynamic Clock Scaling (동적 클럭 가변) ----
+    // CLK을 실제로 만드는 건 begin(true, ...)로 초기화된 딱 한 노드의 Timer1(CTC + COM1A0
+    // 하드웨어 자동 토글)뿐이다. 나머지 노드는 CLK을 그냥 받아서 따라갈 뿐이라 여기서 아무것도
+    // 할 수 없다 - 그래서 _isClkMaster가 false면 _clkGoFast/_clkGoSlow는 완전한 no-op이어야 한다.
+    static volatile bool _isClkMaster;
+    static uint16_t _ocrArb;   // ARB(중재)/ACK 구간용 저속 OCR1A (안전 최우선)
+    static uint16_t _ocrData; // DATA(페이로드) 구간용 고속 OCR1A (실측으로 튜닝해서 넣을 값)
+
+    // freq(Hz) -> OCR1A 값 변환. setupTimer1()의 공식과 동일해야 한다(분주비 1 고정 전제).
+    static inline uint16_t _freqToOcr(unsigned long freq) {
+        return (uint16_t)((F_CPU / (2UL * freq)) - 1);
+    }
+
+    // ARB(중재)가 끝나고 LEN/DATA로 넘어가는 그 순간(=에지 ISR 진입 직후, TCNT1이 막 0으로
+    // 리셋된 시점) 호출한다. CTC 모드에서는 컴페어 매치 직후 TCNT1이 항상 0이므로, 이 타이밍에
+    // OCR1A를 새 값으로 바꿔도 65536까지 한 바퀴 도는 글리치 없이 다음 반주기부터 바로 적용된다.
+    static inline void _clkGoFast() __attribute__((always_inline)) {
+        if (_isClkMaster) OCR1A = _ocrData;
+    }
+    // DATA가 끝나고 ACK/유휴로 돌아가는 순간, 그리고 버스 idle 리셋 시점에 호출해서 항상
+    // ARB에 안전한 저속으로 복귀시킨다.
+    static inline void _clkGoSlow() __attribute__((always_inline)) {
+        if (_isClkMaster) OCR1A = _ocrArb;
+    }
 };
 
 template <DataPreset PRESET>
@@ -108,11 +133,22 @@ public:
         _nodeId = nodeId & SWP2P_NODE_MASK;
     }
 
-    void begin(bool clkIsOutput, unsigned long clkFreq = 100000UL)
+    // dataFreq를 생략하면(0) clkFreq와 동일하게 취급되어 기존과 완전히 동일하게 동작한다
+    // (=동적 클럭 기능을 켜지 않은 기존 사용자 코드는 아무 영향 없음).
+    // dataFreq를 지정하면: ARB/ACK 구간은 clkFreq(저속, 안전 우선), DATA(페이로드) 구간만
+    // dataFreq(고속)로 잠깐 가속했다가 ACK 대기에 들어가는 순간 다시 clkFreq로 돌아온다.
+    // dataFreq 값은 "이론상 최댓값"이 아니라 실측으로 정해야 한다 - 이 버스에 붙은 노드 중
+    // 가장 느린 노드(WIDTH가 넓을수록, ISR이 무거울수록 느림)가 감내 못하면 에지를 놓쳐
+    // 프레임이 깨진다. CRC 없이 속도를 올리면 깨진 데이터도 조용히 통과할 수 있으니 주의.
+    void begin(bool clkIsOutput, unsigned long clkFreq = 100000UL, unsigned long dataFreq = 0)
     {
         GPIOR0 = 0;
         _txState = 0; // GPIOR1
         _rxState = 0; // GPIOR2
+
+        _isClkMaster = clkIsOutput;
+        _ocrArb  = _freqToOcr(clkFreq);
+        _ocrData = _freqToOcr(dataFreq != 0 ? dataFreq : clkFreq);
 
         // DDRD2(0b00000100) 비트 0으로 클리어 (D2 입력 설정)
         DDRD &= ~(1 << DDD2);   // [xxxx xxxx] &= [1111 1011] => [xxxx x0xx]
@@ -360,6 +396,7 @@ public:
                         // [시프트 & DATA_MASK] MSB 비트들을 하위로 내린 후 2^N-1 마스크로 필요 크기만 추출
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
                         _txDataReg <<= DATA_WIDTH;
+                        _clkGoFast(); // ARB 끝, LEN부터는 페이로드 구간으로 취급해 가속
                         _driveDataChunk(chunk);
                         _txDataChunkCount--;
                         _txIdx = 0;
@@ -369,6 +406,7 @@ public:
                         _txDataChunkCount = ARB_CYCLES;
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
                         _txDataReg <<= DATA_WIDTH;
+                        _clkGoFast(); // ARB 끝, 곧바로 DATA로 진입하므로 여기서 가속
                         _driveDataChunk(chunk);
                         _txDataChunkCount--;
                         _txState = 4; // TX_DATA
@@ -416,6 +454,7 @@ public:
                         // BUSY(D3)는 계속 잡고 ACK 대기 상태(7)로 넘어가서 PB0(ACK)이 LOW로
                         // 내려오는지 확인한다.
                         _dataRelease();
+                        _clkGoSlow(); // DATA 끝 -> ACK 대기부터는 다시 저속으로 복귀
                         _ackWaitCount = ACK_WAIT_EDGES;
                         _txState = 7; // TX_WAIT_ACK
                     }
@@ -505,6 +544,7 @@ public:
                             uint8_t remain = (8 - srcDoneBits) / DATA_WIDTH;
                             if (remain == 0) {
                                 // srcId까지 이 청크로 끝남 -> RX_SRC 완료 처리를 그대로 이어서 수행
+                                _clkGoFast(); // ARB(dest+src) 완전히 끝남 -> LEN/DATA 페이로드 구간 가속
                                 if (GET_FLAG(FLAG_RX_IS_BURST)) {
                                     _rxDataByte = 0; _rxChunkCount = ARB_CYCLES; _rxState = 3; // RX_LEN
                                 } else {
@@ -542,6 +582,7 @@ public:
                         _rxDataByte = 0;
                         _rxChunkCount = ARB_CYCLES;
                     } else {
+                        _clkGoSlow(); // DATA 끝 -> ACK부터는 다시 저속으로 복귀
                         _rxState = 5; // RX_ACK
                     }
                 } else {
@@ -570,6 +611,7 @@ public:
                 _rxSrcByte = (_rxSrcByte << DATA_WIDTH) | v;
                 _rxChunkCount--;
                 if (_rxChunkCount == 0) {
+                    _clkGoFast(); // ARB(dest+src) 끝 -> LEN/DATA 페이로드 구간 가속
                     if (GET_FLAG(FLAG_RX_IS_BURST)) {
                         _rxDataByte = 0;
                         _rxChunkCount = ARB_CYCLES;
@@ -614,6 +656,9 @@ public:
             DDRB &= ~(1 << DDB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 입력/해제)
             CLR_FLAG(FLAG_RX_CAPTURED);
             CLR_FLAG(FLAG_RX_IS_BURST);
+            // 방어적 backstop: ARB/DATA 전환 훅을 어디선가 놓쳤더라도(버그, 예외 경로 등)
+            // 버스가 idle로 돌아오는 시점엔 무조건 저속(ARB 안전속도)으로 맞춰둔다.
+            _clkGoSlow();
             _rxState = 0;
             _rxAddrByte = 0;
             _rxSrcByte = 0;

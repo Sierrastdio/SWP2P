@@ -6,7 +6,7 @@
 
 #include <Arduino.h>
 #include "SWP2P.h"
-#include "SWP2PBuffer.h"
+#include "SWP2Pbuffer.h"
 
 // Set up 4-bit data line preset (D4~D7) and Node ID 0x02
 SWP2P<PRESET_W4_D4_D7> p2p(0x02);

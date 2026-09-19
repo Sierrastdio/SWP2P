@@ -39,6 +39,11 @@ volatile uint8_t SWP2PBase::_arbMyChunk = 0;
 volatile uint8_t SWP2PBase::_arbChunksSent = 0; // [버그1 수정]
 volatile uint8_t SWP2PBase::_ackWaitCount = 0;  // [버그4 수정]
 
+// ---- Dynamic Clock Scaling ----
+volatile bool SWP2PBase::_isClkMaster = false;
+uint16_t SWP2PBase::_ocrArb = 0;
+uint16_t SWP2PBase::_ocrData = 0;
+
 volatile uint8_t SWP2PBase::_rxAddrByte = 0;
 volatile uint8_t SWP2PBase::_rxSrcByte = 0;
 volatile uint8_t SWP2PBase::_rxDataByte = 0;
