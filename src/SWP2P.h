@@ -25,39 +25,31 @@
 #include "SWP2PPreset.h" // DataPreset enum, 프리셋별 핀 조작(_driveDataChunk 등), WIDTH 관련 상수는 전부 여기로 이동됨
 
 #define SWP2P_FIFO_DEPTH 16
-#define SWP2P_MAX_BURST   16  // _txBuffer 크기. len-2를 8비트 레지스터에 실어 보내므로 이론상 257까지 가능하지만
+#define SWP2P_MAX_BURST   16  // TX buffer capacity; LEN width is derived at compile time (1..255).
                               // RAM 절약 위해 우선 16으로 제한 (필요시 늘리면 됨).
-                              // WARNING: 이거 때문에 SWP2PBuffer<32> myBuf; 와 같이 16바이트를 초과하는 버퍼를 설정할 경우,
-                              //          자동 분할 전송되지 않으며 버퍼 오버플로우가 발생할 수 있음.
-                              //          16바이트씩 두번의 통신 프레임으로 전송될것임.
-                              //          16바이트 초과 데이터 전송이 필요하면 이 상수를 해당 크기만큼 늘려야 함.
-                              //          아니면 myBuf1, myBuf2 등 한 데이터에 여러개의 버퍼를 사용해야함.
 
 // ---- 주소 인코딩 ----
-// destId 바이트의 MSB(bit7)를 "burst 프레임 여부" 플래그로 사용.
-// 그 결과 실제 NODE_ID는 0~126(7비트)만 쓸 수 있고, 브로드캐스트 주소도 0x7F로 바뀐다.
-// (노드 수가 10개 안팎이라 7비트 주소공간으로 충분하다는 전제)
-#define SWP2P_NODE_MASK   0x7F  // 0111 1111
-#define SWP2P_BURST_BIT   0x80  // 1000 0000
-#define SWP2P_BROADCAST   0x7F  // 0111 1111
+// Wire header is DEST(6), SRC(6), BURST(1), MSB first; IDs 0..62, 63 broadcast.
+// SWP2P_BURST_BIT is an internal marker in _txDestId, not a wire-byte bit.
+#define SWP2P_NODE_MASK   0x3F  // 0011 1111
+#define SWP2P_BURST_BIT   0x80
+#define SWP2P_BROADCAST   0x3F  // 0011 1111
 
 #define FLAG_IS_SENDING   0
 #define FLAG_IS_BUSY      1
-#define FLAG_RX_CAPTURED  2
 #define FLAG_IS_MY_PACKET 3
-#define FLAG_RX_IS_BURST  4   // 이번 수신 프레임이 burst인지 (RX_SRC 완료 시점에 결정되어 저장됨)
 #define FLAG_ACK_FAILED   5   // 직전 송신이 ACK를 못 받고 타임아웃됐는지 (isAckFailed()로 조회)
 
 // GPIOR0 플래그 비트 연산 추적 주석 추가
-#define SET_FLAG(b) (GPIOR0 |= (1 << (b)))   // [xxxx xxxx] |= [0000 0001 << b]  => [b번 비트만 1로 Set]
-#define CLR_FLAG(b) (GPIOR0 &= ~(1 << (b)))  // [xxxx xxxx] &= [1111 1110 << b]  => [b번 비트만 0으로 Clear]
-#define GET_FLAG(b) (GPIOR0 & (1 << (b)))   // [xxxx xxxx] &  [0000 0001 << b]  => [b번 비트가 1이면 >0, 0이면 0]
+#define SET_FLAG(b) (GPIOR0 |= _BV(b))
+#define CLR_FLAG(b) (GPIOR0 &= ~_BV(b))
+#define GET_FLAG(b) (GPIOR0 & _BV(b))
 
 // DataPreset enum 및 Arduino 핀아웃 관련 내용은 SWP2PPreset.h로 이동됨
 
 // ---- Tx/Rx 상태 번호 ----
-// Tx: 0 IDLE, 1 PENDING, 2 ARB, 3 LEN, 4 DATA, 5 RELEASE/DONE, 6 LOST
-// Rx: 0 IDLE, 1 ADDR, 2 SRC, 3 LEN, 4 DATA, 5 ACK
+// Tx: 0 IDLE, 1 PENDING, 2 ARB, 3 LEN, 4 DATA, 6 LOST, 7 WAIT_ACK
+// Rx: 0 IDLE/filtered, 1 packed header, 3 LEN, 4 addressed DATA, 5 ACK, 6 clock-master discard
 
 class SWP2PBase {
 public:
@@ -72,7 +64,7 @@ public:
     #define _txState GPIOR1
     #define _rxState GPIOR2
 
-    static uint8_t _txDestId;      // MSB=burst 플래그가 이미 인코딩된 상태로 저장됨
+    static uint8_t _txDestId;      // 6-bit destination plus temporary burst flag
     static uint8_t _txData;        // len==1일 때만 사용 (기존 빠른 경로 그대로 유지)
     static uint8_t _txBuffer[SWP2P_MAX_BURST]; // len>1일 때 사용
     static uint8_t _txLen;
@@ -82,16 +74,16 @@ public:
     // volatile을 뗐다 - volatile이 붙으면 같은 함수 안에서도 매번 SRAM으로 다시 읽고/쓰게
     // 강제되어(레지스터 캐싱 금지) 에지마다 불필요한 load/store가 늘어난다.
     static uint16_t _txArbReg;
-    static uint8_t _txDataReg;   // 데이터 바이트 전송용 + LEN 필드 전송에도 재사용
+    static uint8_t _txDataReg;   // data byte or left-aligned LEN bits
     static uint8_t _arbChunkCount;
     static uint8_t _txDataChunkCount;
     static uint8_t _arbMyChunk;
     static uint8_t _arbChunksSent; // [버그1 수정] 이번 중재 라운드에서 "드라이브+비교까지 끝난" 청크 수(이번 것 포함)
     static uint8_t _ackWaitCount;  // [버그4 수정] ACK 대기 중 남은 edge 수 (0이면 타임아웃)
 
-    static uint8_t _rxAddrByte;
+    static uint8_t _rxAddrByte; // high byte of the packed 13-bit arbitration header
     static uint8_t _rxSrcByte;
-    static uint8_t _rxDataByte;   // 데이터 바이트 수신용 + LEN 필드 수신에도 재사용
+    static uint8_t _rxDataByte;   // data byte or packed LEN accumulator
     static uint8_t _rxChunkCount;
     static uint8_t _rxLen;        // 이번 프레임에서 받아야 할 총 바이트 수
     static uint8_t _rxByteIdx;    // 지금까지 받은 바이트 수
@@ -146,8 +138,9 @@ public:
 
     SWP2P(uint8_t nodeId)
     {
-        // [xxxx xxxx] & [0111 1111] => [0xxx xxxx] (7비트 주소만 마스킹)
+        // Keep the broadcast value reserved for destination addressing.
         _nodeId = nodeId & SWP2P_NODE_MASK;
+        if (_nodeId == SWP2P_BROADCAST) --_nodeId;
     }
 
     // dataFreq를 생략하면(0) clkFreq와 동일하게 취급되어 기존과 완전히 동일하게 동작한다
@@ -168,34 +161,34 @@ public:
         _ocrData = _freqToOcr(dataFreq != 0 ? dataFreq : clkFreq);
 
         // DDRD2(0b00000100) 비트 0으로 클리어 (D2 입력 설정)
-        DDRD &= ~(1 << DDD2);   // [xxxx xxxx] &= [1111 1011] => [xxxx x0xx]
+        DDRD &= ~_BV(DDD2);   // [xxxx xxxx] &= [1111 1011] => [xxxx x0xx]
         // PORTD2(0b00000100) 비트 0으로 클리어 (D2 풀업 해제)
-        PORTD &= ~(1 << PORTD2); // [xxxx xxxx] &= [1111 1011] => [xxxx x0xx]
+        PORTD &= ~_BV(PORTD2); // [xxxx xxxx] &= [1111 1011] => [xxxx x0xx]
 
-        PORTD &= ~(1 << PORTD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 출력 0)
-        DDRD &= ~(1 << DDD3);   // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 입력 설정)
-        PORTB &= ~(1 << PORTB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 출력 0)
-        DDRB &= ~(1 << DDB0);   // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 입력 설정)
+        PORTD &= ~_BV(PORTD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 출력 0)
+        DDRD &= ~_BV(DDD3);   // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 입력 설정)
+        PORTB &= ~_BV(PORTB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 출력 0)
+        DDRB &= ~_BV(DDB0);   // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 입력 설정)
 
         _dataRelease();
 
         if (clkIsOutput) {
-            DDRB |= (1 << DDB1); // [xxxx xxxx] |= [0000 0010] => [xxxx xx1x] (PB1 출력 설정)
+            DDRB |= _BV(DDB1); // [xxxx xxxx] |= [0000 0010] => [xxxx xx1x] (PB1 출력 설정)
             setupTimer1(clkFreq);
         } else {
             TCCR1A = 0;
-            TCCR1B = (1 << CS10); // [0000 0000] = [0000 0001] (Timer1 분주비 1 설정)
+            TCCR1B = _BV(CS10); // [0000 0000] = [0000 0001] (Timer1 분주비 1 설정)
         }
 
         // TCCR1B: 노이즈 캔슬러(ICNC1) 및 엣지 세팅
-        TCCR1B |= (1 << ICNC1); // [xxxx xxxx] |= [1000 0000] => [1xxx xxxx] (노이즈 캔슬러 ON)
-        TCCR1B |= (1 << ICES1); // [xxxx xxxx] |= [0100 0000] => [x1xx xxxx] (Rising Edge 캡처)
-        TIMSK1 |= (1 << ICIE1); // [xxxx xxxx] |= [0010 0000] => [xx1x xxxx] (Capture 인터럽트 ON)
+        TCCR1B |= _BV(ICNC1); // [xxxx xxxx] |= [1000 0000] => [1xxx xxxx] (노이즈 캔슬러 ON)
+        TCCR1B |= _BV(ICES1); // [xxxx xxxx] |= [0100 0000] => [x1xx xxxx] (Rising Edge 캡처)
+        TIMSK1 |= _BV(ICIE1); // [xxxx xxxx] |= [0010 0000] => [xx1x xxxx] (Capture 인터럽트 ON)
 
         // EICRA: INT0 설정 (ISC01, ISC00 비트)
-        EICRA &= ~((1 << ISC01) | (1 << ISC00)); // [xxxx xxxx] &= [1111 0011] => [xxxx 00xx] (INT0 초기화)
-        EICRA |= (1 << ISC00);                   // [xxxx xxxx] |= [0000 0001] => [xxxx xx01] (INT0 Logical Change)
-        EIMSK |= (1 << INT0);                    // [xxxx xxxx] |= [0000 0001] => [xxxx xxx1] (INT0 Enable)
+        EICRA &= ~(_BV(ISC01) | _BV(ISC00)); // [xxxx xxxx] &= [1111 0011] => [xxxx 00xx] (INT0 초기화)
+        EICRA |= _BV(ISC00);                   // [xxxx xxxx] |= [0000 0001] => [xxxx xx01] (INT0 Logical Change)
+        EIMSK |= _BV(INT0);                    // [xxxx xxxx] |= [0000 0001] => [xxxx xxx1] (INT0 Enable)
 
         // EICRA: INT1 설정 (ISC11, ISC10 비트)
         // 주의: Low Level(00)로 두면 D3(BUSY)가 LOW인 "동안"만 인터럽트가 걸리고, HIGH로
@@ -203,9 +196,9 @@ public:
         // idle 분기(FLAG_IS_BUSY를 푸는 유일한 지점)가 바로 그 상승 엣지에서 실행돼야
         // 하므로, Any Logical Change(01)로 바꿔서 양쪽 엣지를 모두 잡아야 한다.
         // (이게 없으면 최초 1회 통신 후 FLAG_IS_BUSY가 영구히 안 풀림 -> 이후 전송 전부 조용히 무시됨)
-        EICRA &= ~((1 << ISC11) | (1 << ISC10)); // [xxxx xxxx] &= [1111 1100] => [xxxx xxxx] (INT1 초기화)
-        EICRA |= (1 << ISC10);                   // [xxxx xxxx] |= [0000 0100] => [xxxx x1xx] (INT1 Any Logical Change)
-        EIMSK |= (1 << INT1);                    // [xxxx xxxx] |= [0000 0010] => [xxxx xx1x] (INT1 Enable)
+        EICRA &= ~(_BV(ISC11) | _BV(ISC10)); // [xxxx xxxx] &= [1111 1100] => [xxxx xxxx] (INT1 초기화)
+        EICRA |= _BV(ISC10);                   // [xxxx xxxx] |= [0000 0100] => [xxxx x1xx] (INT1 Any Logical Change)
+        EIMSK |= _BV(INT1);                    // [xxxx xxxx] |= [0000 0010] => [xxxx xx1x] (INT1 Enable)
 
         sei();
     }
@@ -217,7 +210,7 @@ public:
 
     bool sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len)
     {
-        if (len == 0 || len > SWP2P_MAX_BURST) return false;
+        if (buf == nullptr || len == 0 || len > SWP2P_MAX_BURST) return false;
 
         if (GET_FLAG(FLAG_IS_SENDING) || GET_FLAG(FLAG_IS_BUSY)) return false;
 
@@ -373,33 +366,68 @@ public:
     static constexpr uint8_t DATA_MASK  = Traits::DATA_MASK;
     static constexpr uint8_t ARB_SHIFT  = Traits::ARB_SHIFT;
     static constexpr uint8_t TX_SHIFT   = Traits::TX_SHIFT;
+    using FrameTraits = SWP2PFrameTraits<PRESET, SWP2P_MAX_BURST>;
+    static constexpr uint8_t LEN_BITS = FrameTraits::LEN_BITS;
+    static constexpr uint8_t LEN_CHUNKS = FrameTraits::LEN_CHUNKS;
+    static constexpr uint8_t LEN_PADDING_BITS = FrameTraits::LEN_PADDING_BITS;
+    static constexpr uint8_t ADDR_CHUNKS = FrameTraits::ADDR_CHUNKS;
+    static constexpr uint8_t ADDR_PADDING_BITS = FrameTraits::ADDR_PADDING_BITS;
 
     // [버그4 수정] ACK 대기 타임아웃 (falling edge 기준 카운트). 수신측은 RX_DATA 마지막 청크를
     // 읽는 바로 그 순간(같은 클럭 사이클)에 곧장 PB0을 LOW로 구동하므로 이론상 거의 즉시 보여야
     // 하지만, 지터/노이즈 캔슬러 지연 여유를 감안해 몇 edge 정도는 기다려준다.
     static constexpr uint8_t ACK_WAIT_EDGES = 4;
 
+    static inline void _finishRxAddress(uint16_t wireHeader) {
+        uint16_t header = wireHeader >> ADDR_PADDING_BITS;
+        uint8_t destId = (header >> 7) & SWP2P_NODE_MASK;
+        bool isBurst = (header & 0x01) != 0;
+        bool addressed = destId == _nodeId || destId == SWP2P_BROADCAST;
+
+        _clkGoFast();
+        if (addressed) SET_FLAG(FLAG_IS_MY_PACKET);
+        else CLR_FLAG(FLAG_IS_MY_PACKET);
+        if (!addressed && !_isClkMaster) {
+            _rxState = 0;
+            return;
+        }
+        _rxSrcByte = (header >> 1) & SWP2P_NODE_MASK;
+        _rxDataByte = 0;
+        _rxByteIdx = 0;
+        if (isBurst) {
+            _rxChunkCount = LEN_CHUNKS;
+            _rxState = 3; // RX_LEN
+        } else {
+            _rxLen = 1;
+            _rxChunkCount = ARB_CYCLES;
+            _rxState = addressed ? 4 : 6;
+        }
+    }
+
     // ============================================================
     // CLK 엣지 핸들러 (INT0)
     // ============================================================
     static void _onClkEdge() {
         // [PIND] & [0000 0100] => [0000 0x00] (CLK=PD2 하이 상태 확인)
-        bool clkHigh = (PIND & (1 << PIND2)) != 0;
+        bool clkHigh = (PIND & _BV(PIND2)) != 0;
 
         if (clkHigh) {
             if (_txState == 1) { // TX_PENDING
-                PORTD &= ~(1 << PORTD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 LOW)
-                DDRD |= (1 << DDD3);     // [xxxx xxxx] |= [0000 1000] => [xxxx 1xxx] (D3 BUSY 출력 켜서 라인 점유)
+                PORTD &= ~_BV(PORTD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 LOW)
+                DDRD |= _BV(DDD3);     // [xxxx xxxx] |= [0000 1000] => [xxxx 1xxx] (D3 BUSY 출력 켜서 라인 점유)
 
-                uint16_t arbReg = ((uint16_t)_txDestId << 8) | _nodeId;
-                // [시프트 & DATA_MASK] 상위 비트를 당겨온 후, DATA_MASK(2^N-1)와 & 연산하여 보낼 청크만 추출
+                uint16_t header =
+                    ((uint16_t)(_txDestId & SWP2P_NODE_MASK) << 7) |
+                    ((uint16_t)_nodeId << 1) |
+                    ((_txDestId & SWP2P_BURST_BIT) ? 1 : 0);
+                uint16_t arbReg = header << (16 - FrameTraits::ADDR_BITS);
                 uint8_t myChunk = (arbReg >> ARB_SHIFT) & DATA_MASK;
-                arbReg <<= DATA_WIDTH;                                // 다음 청크 전송 준비
+                arbReg <<= DATA_WIDTH;
                 _driveDataChunk(myChunk);
                 _txArbReg = arbReg;
                 _arbMyChunk = myChunk;
                 _arbChunksSent = 1; // [버그1 수정] 이번이 첫 청크
-                _arbChunkCount = (2 * ARB_CYCLES) - 1;
+                _arbChunkCount = ADDR_CHUNKS - 1;
                 _txState = 2; // TX_ARB
                 return;
             }
@@ -408,8 +436,8 @@ public:
                 uint8_t chunkCnt = _arbChunkCount;
                 if (chunkCnt == 0) {
                     if (_txLen > 1) {
-                        _txDataReg = _txLen - 2;
-                        _txDataChunkCount = ARB_CYCLES;
+                        _txDataReg = (_txLen - 2) << (8 - LEN_BITS);
+                        _txDataChunkCount = LEN_CHUNKS;
                         // [시프트 & DATA_MASK] MSB 비트들을 하위로 내린 후 2^N-1 마스크로 필요 크기만 추출
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
                         _txDataReg <<= DATA_WIDTH;
@@ -488,16 +516,16 @@ public:
             //  직접 처리하게 되면서 더 이상 쓰이지 않음 - falling-edge 쪽 state7 핸들러 참고)
         } else {
             if (_txState == 7) { // [버그4 수정] TX_WAIT_ACK negedge: ACK(PB0=D8) 확인
-                bool acked = (PINB & (1 << PINB0)) == 0; // 수신측이 PB0을 LOW로 구동했는지
+                bool acked = (PINB & _BV(PINB0)) == 0; // 수신측이 PB0을 LOW로 구동했는지
                 if (acked) {
                     CLR_FLAG(FLAG_ACK_FAILED);
-                    DDRD &= ~(1 << DDD3); // BUSY 해제
+                    DDRD &= ~_BV(DDD3); // BUSY 해제
                     CLR_FLAG(FLAG_IS_SENDING);
                     _txState = 0;
                 } else if (_ackWaitCount == 0) {
                     // 타임아웃: ACK 못 받았지만 버스는 풀어줘야 다른 노드가 계속 쓸 수 있음
                     SET_FLAG(FLAG_ACK_FAILED);
-                    DDRD &= ~(1 << DDD3);
+                    DDRD &= ~_BV(DDD3);
                     CLR_FLAG(FLAG_IS_SENDING);
                     _txState = 0;
                 } else {
@@ -510,7 +538,7 @@ public:
                 // [내가 보낸 비트] & ~[버스의 실제 비트] => 내가 0(구동)인데 버스가 1이면 충돌(패배)
                 if ((_arbMyChunk & ~busVal) != 0) {
                     _dataRelease();
-                    DDRD &= ~(1 << DDD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (BUSY 해제 - 내 쪽만. 승자가 계속 잡고있으므로 버스 자체는 그대로 busy)
+                    DDRD &= ~_BV(DDD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (BUSY 해제 - 내 쪽만. 승자가 계속 잡고있으므로 버스 자체는 그대로 busy)
                     CLR_FLAG(FLAG_IS_SENDING);
 
                     // [버그1 수정] 중재 패배 = 지금 이 순간 "더 높은 우선순위 노드가 주소 필드를
@@ -520,57 +548,30 @@ public:
                     // "내가 보낸 값 == 실제 버스 값"이었다는 뜻이므로, 내가 보내려 했던 원본 주소값을
                     // 그대로 재사용해서 복원할 수 있다. 단, 지금 막 충돌이 감지된 이 청크 하나만은
                     // 방금 읽은 busVal이 진짜 값이므로 그걸로 교체한다.
-                    {
-                        uint16_t myOriginal = ((uint16_t)_txDestId << 8) | _nodeId; // 내가 보내려던 16비트 주소(destId<<8 | srcId)
-                        uint8_t doneBits = _arbChunksSent * DATA_WIDTH; // 지금까지(이 청크 포함) 확정된 비트 수
-                        // myOriginal의 상위 doneBits비트를 오른쪽 정렬로 뽑아낸 뒤, 마지막 청크(현재 충돌한 것)만
-                        // busVal로 교정 -> "지금까지 실제로 오간 값" 그대로 복원됨 (accumulator가 원래
-                        // 왼쪽시프트+OR로 채워나가는 것과 동일한 오른쪽 정렬 방식)
-                        uint16_t known = myOriginal >> (16 - doneBits);
-                        known = (uint16_t)(known & ~(uint16_t)DATA_MASK) | busVal;
+                    uint16_t original =
+                        ((uint16_t)(_txDestId & SWP2P_NODE_MASK) << 7) |
+                        ((uint16_t)_nodeId << 1) |
+                        ((_txDestId & SWP2P_BURST_BIT) ? 1 : 0);
+                    original <<= (16 - FrameTraits::ADDR_BITS);
+                    uint8_t doneBits = _arbChunksSent * DATA_WIDTH;
+                    uint16_t known = original >> (16 - doneBits);
+                    known = (known & ~(uint16_t)DATA_MASK) | busVal;
 
-                        if (doneBits <= 8) {
-                            // 아직 destId 필드 진행 중(또는 막 끝난 시점)
-                            _rxAddrByte = (uint8_t)known;
-                            uint8_t remain = (8 - doneBits) / DATA_WIDTH;
-                            if (remain == 0) {
-                                // destId 필드가 이 청크로 끝남 -> RX_ADDR 완료 처리를 그대로 이어서 수행
-                                uint8_t addr7 = _rxAddrByte & SWP2P_NODE_MASK;
-                                bool isBurst = (_rxAddrByte & SWP2P_BURST_BIT) != 0;
-                                if (isBurst) SET_FLAG(FLAG_RX_IS_BURST); else CLR_FLAG(FLAG_RX_IS_BURST);
-                                if (addr7 == _nodeId || addr7 == SWP2P_BROADCAST) SET_FLAG(FLAG_IS_MY_PACKET);
-                                else CLR_FLAG(FLAG_IS_MY_PACKET);
-                                _rxSrcByte = 0;
-                                _rxChunkCount = ARB_CYCLES;
-                                _rxState = 2; // RX_SRC
-                            } else {
-                                _rxChunkCount = remain;
-                                _rxState = 1; // RX_ADDR (이어서 계속)
+                    _rxAddrByte = known >> 8;
+                    _rxSrcByte = known;
+                    uint8_t remaining = ADDR_CHUNKS - _arbChunksSent;
+                    if (remaining == 0) _finishRxAddress(known);
+                    else {
+                        if (doneBits >= 6) {
+                            uint8_t destId = known >> (doneBits - 6);
+                            if (destId != _nodeId && destId != SWP2P_BROADCAST && !_isClkMaster) _rxState = 0;
+                            else {
+                                _rxChunkCount = remaining;
+                                _rxState = 1;
                             }
                         } else {
-                            // 이미 srcId 필드로 넘어간 시점 -> destId는 이미 전부 확정됨(=내가 보내려던 destId 그대로,
-                            // 여기까지 충돌이 없었다는 것 자체가 그 증거)
-                            uint8_t addr7 = _txDestId & SWP2P_NODE_MASK;
-                            bool isBurst = (_txDestId & SWP2P_BURST_BIT) != 0;
-                            if (isBurst) SET_FLAG(FLAG_RX_IS_BURST); else CLR_FLAG(FLAG_RX_IS_BURST);
-                            if (addr7 == _nodeId || addr7 == SWP2P_BROADCAST) SET_FLAG(FLAG_IS_MY_PACKET);
-                            else CLR_FLAG(FLAG_IS_MY_PACKET);
-
-                            uint8_t srcDoneBits = doneBits - 8;
-                            _rxSrcByte = (uint8_t)(known & (((uint16_t)1 << srcDoneBits) - 1));
-                            uint8_t remain = (8 - srcDoneBits) / DATA_WIDTH;
-                            if (remain == 0) {
-                                // srcId까지 이 청크로 끝남 -> RX_SRC 완료 처리를 그대로 이어서 수행
-                                _clkGoFast(); // ARB(dest+src) 완전히 끝남 -> LEN/DATA 페이로드 구간 가속
-                                if (GET_FLAG(FLAG_RX_IS_BURST)) {
-                                    _rxDataByte = 0; _rxChunkCount = ARB_CYCLES; _rxState = 3; // RX_LEN
-                                } else {
-                                    _rxDataByte = 0; _rxChunkCount = ARB_CYCLES; _rxLen = 1; _rxByteIdx = 0; _rxState = 4; // RX_DATA
-                                }
-                            } else {
-                                _rxChunkCount = remain;
-                                _rxState = 2; // RX_SRC (이어서 계속)
-                            }
+                            _rxChunkCount = remaining;
+                            _rxState = 1; // Continue receiving packed DEST/SRC/BURST header.
                         }
                     }
 
@@ -590,10 +591,7 @@ public:
                 uint8_t dataByte = (_rxDataByte << DATA_WIDTH) | v;
                 uint8_t chunkCnt = _rxChunkCount - 1;
                 if (chunkCnt == 0) {
-                    if (GET_FLAG(FLAG_IS_MY_PACKET)) {
-                        _fifoPush(dataByte, _rxSrcByte); // [발신자 ID 수정] RX_SRC 단계에서 이미 확정된 발신자 ID를 데이터와 함께 큐에 넣음
-                        SET_FLAG(FLAG_RX_CAPTURED);
-                    }
+                    _fifoPush(dataByte, _rxSrcByte);
                     _rxByteIdx++;
                     if (_rxByteIdx < _rxLen) {
                         _rxDataByte = 0;
@@ -606,39 +604,18 @@ public:
                     _rxDataByte = dataByte;
                     _rxChunkCount = chunkCnt;
                 }
-            } else if (rxState == 1) { // RX_ADDR
-                uint8_t v = _readDataChunk();
-                _rxAddrByte = (_rxAddrByte << DATA_WIDTH) | v;
+            } else if (rxState == 1) { // RX packed DEST(6) + SRC(6) + BURST(1)
+                uint16_t header = ((uint16_t)_rxAddrByte << 8) | _rxSrcByte;
+                header = (header << DATA_WIDTH) | _readDataChunk();
                 _rxChunkCount--;
-                if (_rxChunkCount == 0) {
-                    uint8_t addr7 = _rxAddrByte & SWP2P_NODE_MASK; // [xxxx xxxx] & [0111 1111] => [0xxx xxxx] (7비트 주소)
-                    bool isBurst = (_rxAddrByte & SWP2P_BURST_BIT) != 0; // [xxxx xxxx] & [1000 0000] => MSB 1인지 체크
-                    if (isBurst) SET_FLAG(FLAG_RX_IS_BURST); else CLR_FLAG(FLAG_RX_IS_BURST);
-                    if (addr7 == _nodeId || addr7 == SWP2P_BROADCAST) {
-                        SET_FLAG(FLAG_IS_MY_PACKET);
-                    } else {
-                        CLR_FLAG(FLAG_IS_MY_PACKET);
-                    }
-                    _rxSrcByte = 0;
-                    _rxChunkCount = ARB_CYCLES;
-                    _rxState = 2; // RX_SRC
-                }
-            } else if (rxState == 2) { // RX_SRC
-                uint8_t v = _readDataChunk();
-                _rxSrcByte = (_rxSrcByte << DATA_WIDTH) | v;
-                _rxChunkCount--;
-                if (_rxChunkCount == 0) {
-                    _clkGoFast(); // ARB(dest+src) 끝 -> LEN/DATA 페이로드 구간 가속
-                    if (GET_FLAG(FLAG_RX_IS_BURST)) {
-                        _rxDataByte = 0;
-                        _rxChunkCount = ARB_CYCLES;
-                        _rxState = 3; // RX_LEN
-                    } else {
-                        _rxDataByte = 0;
-                        _rxChunkCount = ARB_CYCLES;
-                        _rxLen = 1;
-                        _rxByteIdx = 0;
-                        _rxState = 4; // RX_DATA
+                if (_rxChunkCount == 0) _finishRxAddress(header);
+                else {
+                    _rxAddrByte = header >> 8;
+                    _rxSrcByte = header;
+                    uint8_t receivedBits = (ADDR_CHUNKS - _rxChunkCount) * DATA_WIDTH;
+                    if (receivedBits >= 6) {
+                        uint8_t destId = header >> (receivedBits - 6);
+                        if (destId != _nodeId && destId != SWP2P_BROADCAST && !_isClkMaster) _rxState = 0;
                     }
                 }
             } else if (rxState == 3) { // RX_LEN
@@ -646,20 +623,36 @@ public:
                 _rxDataByte = (_rxDataByte << DATA_WIDTH) | v;
                 _rxChunkCount--;
                 if (_rxChunkCount == 0) {
-                    _rxLen = _rxDataByte + 2;
+                    _rxLen = (_rxDataByte >> LEN_PADDING_BITS) + 2;
+                    if (_rxLen > SWP2P_MAX_BURST) {
+                        _rxByteIdx = 0;
+                        _rxChunkCount = ARB_CYCLES;
+                        _rxState = _isClkMaster ? 6 : 0;
+                        return;
+                    }
                     _rxByteIdx = 0;
                     _rxDataByte = 0;
                     _rxChunkCount = ARB_CYCLES;
-                    _rxState = 4; // RX_DATA
+                    _rxState = GET_FLAG(FLAG_IS_MY_PACKET) ? 4 : 6;
+                }
+            } else if (rxState == 6) { // RX_DISCARD: clock-master observes frame end without sampling data
+                uint8_t chunkCnt = _rxChunkCount - 1;
+                if (chunkCnt == 0) {
+                    _rxByteIdx++;
+                    if (_rxByteIdx < _rxLen) _rxChunkCount = ARB_CYCLES;
+                    else {
+                        _clkGoSlow();
+                        _rxState = 0;
+                    }
+                } else {
+                    _rxChunkCount = chunkCnt;
                 }
             } else if (rxState == 5) { // RX_ACK
                 // [버그4 전제 수정] 원래는 addressing 여부와 무관하게 무조건 ACK를 쏴서,
                 // 모든 리슨 노드가 매 패킷마다 ACK를 구동했음(= ACK가 "내가 받았다"는 증거로 쓸모없었음).
                 // 실제 목적지였던 노드만 ACK를 구동하도록 게이트.
-                if (GET_FLAG(FLAG_IS_MY_PACKET)) {
-                    PORTB &= ~(1 << PORTB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 LOW)
-                    DDRB |= (1 << DDB0);     // [xxxx xxxx] |= [0000 0001] => [xxxx xxx1] (PB0 ACK 응답 구동)
-                }
+                PORTB &= ~_BV(PORTB0);
+                DDRB |= _BV(DDB0);
                 _rxState = 0;
             }
         }
@@ -667,12 +660,10 @@ public:
 
     static void _onBusyEdge() {
         // [PIND] & [0000 1000] => [0000 x000] (BUSY=PD3 상태 확인)
-        bool idle = (PIND & (1 << PIND3)) != 0;
+        bool idle = (PIND & _BV(PIND3)) != 0;
         if (idle) {
             CLR_FLAG(FLAG_IS_BUSY);
-            DDRB &= ~(1 << DDB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 입력/해제)
-            CLR_FLAG(FLAG_RX_CAPTURED);
-            CLR_FLAG(FLAG_RX_IS_BURST);
+            DDRB &= ~_BV(DDB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 입력/해제)
             // 방어적 backstop: ARB/DATA 전환 훅을 어디선가 놓쳤더라도(버그, 예외 경로 등)
             // 버스가 idle로 돌아오는 시점엔 무조건 저속(ARB 안전속도)으로 맞춰둔다.
             _clkGoSlow();
@@ -691,14 +682,14 @@ public:
             if (_txState == 0) {
                 _rxState = 1;
                 _rxAddrByte = 0;
-                _rxChunkCount = ARB_CYCLES;
+                _rxChunkCount = ADDR_CHUNKS;
             }
         }
     }
 
     static void _onAckCapture() {
         // [TCCR1B] ^= [0100 0000] => ICES1( bit6 ) 반전 (Rising Edge <-> Falling Edge 캡처 극성 토글)
-        TCCR1B ^= (1 << ICES1);
+        TCCR1B ^= _BV(ICES1);
     }
 };
 

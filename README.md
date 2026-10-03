@@ -71,7 +71,7 @@ void node.begin(bool clkIsOutput, unsigned long clkFreq = 100000UL);
 SWP2P_BIND_ISRS(DataPreset);
 ```
 
-- `nodeId` is masked to 7 bits (0–126). `0x7F` (127) is reserved as the broadcast address.
+- Use node IDs 0–62; `0x3F` (63) is reserved for broadcast. The constructor masks IDs to six bits and maps reserved ID 63 to 62.
 - If `clkIsOutput = true`, this node automatically drives CLK using Timer1.
 - `SWP2P_BIND_ISRS(preset)` expands to the `ISR(INT0_vect)`, `ISR(INT1_vect)`, and `ISR(TIMER1_CAPT_vect)` definitions bound to that specific `SWP2P<preset>` specialization. Call it exactly once for whichever preset you actually use.
 
@@ -83,7 +83,7 @@ bool node.sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len);
 ```
 
 - `send()` is the single-byte fast path (no LEN field).
-- `sendBurst()` automatically sets the burst flag (MSB of the destination byte) when `len > 1`, and transmits an additional LEN field (encoded as `len - 2`). `len` must be between 1 and `SWP2P_MAX_BURST` (default 16, can be increased if needed).
+- `sendBurst()` sets the BURST bit after the 6-bit DEST and 6-bit SRC fields when `len > 1`, then transmits a compact LEN field containing `len - 2`. LEN width is derived from `SWP2P_MAX_BURST` and rounded to whole preset-width chunks. `len` must be between 1 and `SWP2P_MAX_BURST` (default 16).
 - Returns `false` if a transfer is already in progress (`isSending()`) or the bus is busy (`isBusy()`).
 - Use `SWP2P<PRESET>::BROADCAST` as `destId` to broadcast to all nodes.
 - A send only completes successfully once the addressed receiver actively acknowledges it (see **Status checks** / `isAckFailed()`).
@@ -153,8 +153,8 @@ A wider data width carries more bits per clock edge, reducing the number of tran
 
 ## Protocol Overview
 
-1. **ARB (Arbitration)**: On each rising CLK edge, 2 bytes — `dest` (MSB = burst flag) and `src` — are driven open-drain, and read back on the falling edge for comparison. If the bus value indicates another node is driving a higher-priority (more "0"-heavy) value, this node immediately yields, enters the `TX_LOST` state, and automatically retries once BUSY returns to idle. While in `TX_LOST`, the node keeps tracking the winner's packet on the RX side instead of going silent, in case that packet is addressed to it.
-2. **LEN (burst frames only)**: The value `len - 2` is encoded and transmitted (this step is skipped for single-byte transfers).
+1. **ARB (Arbitration)**: The packed header is `DEST(6) + SRC(6) + BURST(1)`, MSB first. It is driven open-drain and read back on each falling edge for arbitration. The wire header is padded to whole preset-width chunks. A losing sender reconstructs the winner's already-transmitted header prefix and continues receiving; it retries after BUSY returns idle.
+2. **LEN (burst frames only)**: The value `len - 2` is encoded using the minimum bit width required by `SWP2P_MAX_BURST`, padded to whole preset-width chunks. This step is skipped for single-byte transfers.
 3. **DATA**: 1 byte (single transfer) or `len` bytes (burst) are transmitted in sequence.
 4. **ACK**: The sender releases the data line(s) but keeps BUSY asserted while it waits a bounded number of clock edges for the addressed receiver to drive ACK low. If the ACK arrives in time, the send is marked successful; otherwise it times out and `isAckFailed()` will report `true` on the next check. Either way, BUSY is released once the wait ends so other nodes can use the bus.
 
@@ -163,8 +163,9 @@ Receiving nodes only capture packets addressed to them (or broadcast packets) in
 ## Design Constraints / Notes
 
 - Data lines must be open-drain with pull-up resistors — testing confirmed that communication is impossible without pull-ups.
-- Node IDs are limited to 0–126; 127 (`SWP2P_BROADCAST`) is reserved for broadcast.
-- Increasing `SWP2P_MAX_BURST` (default 16) allows burst transfers of up to 257 bytes in theory, but increases RAM usage accordingly. Note that a `SWP2PBuffer<CAP>` with `CAP` larger than `SWP2P_MAX_BURST` will fail to compile (`static_assert`); it is not automatically split into multiple frames.
+- Node IDs are limited to 0–62; 63 (`SWP2P_BROADCAST`) is reserved for broadcast. The 13-bit packed header takes 13 clocks at W1, 7 at W2, 4 at W4, and 2 at W8. Compared with the old 16-bit header, W1 saves 3 clocks and W2 saves 1; W4 and W8 use the same number of whole chunks.
+- `SWP2P_MAX_BURST` is limited to 255 by the 8-bit API length. The LEN field width is derived at compile time; increasing the limit also increases required LEN bits and TX buffer RAM. `SWP2PBuffer<CAP>` with `CAP > SWP2P_MAX_BURST` fails at compile time and is not split automatically.
+- This packed-header/LEN format is not wire-compatible with older releases; every node on a bus must use the same format.
 - The maximum usable clock frequency depends on your environment (pull-up resistor values, wiring, WIDTH setting); measuring and tuning it empirically is recommended.
 
 ## File Overview
@@ -188,7 +189,7 @@ SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 �
 - **마스터 없는 구조**: CLK을 출력하는 노드가 있을 수는 있지만, 그 노드가 버스의 주인(마스터) 역할을 하지 않습니다. 모든 노드가 대등하게 송수신에 참여합니다.
 - **가변 데이터 폭**: 데이터선을 1/2/4/8개 중에서 선택할 수 있습니다 (`DataPreset`). 선 개수가 늘어날수록 사이클당 더 많은 비트를 실어 전송 속도를 높일 수 있습니다.
 - **CLK/BUSY/ACK 3선 기반 프로토콜**: 최소한의 제어선(BUSY, ACK)만으로 다수 노드(설계 목표 약 10개) 연결을 지원합니다.
-- **비트 단위 중재(arbitration)**: 목적지 주소(dest) + 발신자 주소(src) 2바이트를 open-drain 방식으로 실어 보내고, 되읽기(readback) 비교를 통해 충돌 시 자동으로 양보(`TX_LOST` → 버스가 idle로 돌아오면 자동 재시도)합니다. 패배한 노드는 자신이 이미 보낸 주소 비트를 복원해두어, 승자의 패킷이 자신에게 온 것이더라도 놓치지 않습니다.
+- **비트 단위 중재(arbitration)**: `DEST(6) + SRC(6) + BURST(1)` 헤더를 MSB부터 open-drain 방식으로 보내고 매 하강 에지에서 되읽어 비교합니다. 패배한 노드는 이미 보낸 헤더 접두부를 복원해 승자 프레임 수신을 이어가며, BUSY가 idle이 되면 재시도합니다.
 - **단일 바이트 / 버스트 전송 모두 지원**: `send()`는 기존 빠른 경로를 그대로 사용하고, `sendBurst()`는 길이(LEN) 필드를 추가로 실어 여러 바이트를 한 번에 전송합니다.
 - **실제 ACK 확인 + 타임아웃**: 데이터를 다 보냈다고 곧바로 성공 처리하지 않고, 목적지 노드가 실제로 ACK 라인을 LOW로 구동하는지 제한된 시간 동안 기다립니다(`isAckFailed()`로 실패 여부 조회 가능).
 - **수신 바이트마다 발신자 ID 동반 제공**: RX FIFO에 데이터 바이트와 발신자 ID가 함께 쌓여, 여러 상대와 통신하는 노드도 출처를 구분할 수 있습니다.
@@ -250,7 +251,7 @@ void node.begin(bool clkIsOutput, unsigned long clkFreq = 100000UL);
 SWP2P_BIND_ISRS(DataPreset);
 ```
 
-- `nodeId`는 7비트(0~126)로 마스킹되어 저장됩니다. `0x7F`(127)은 브로드캐스트 전용 주소로 예약되어 있습니다.
+- 노드 ID는 0~62를 사용하고 `0x3F`(63)은 브로드캐스트 전용입니다. 생성자는 ID를 6비트로 마스킹하며 예약값 63은 62로 조정합니다.
 - `clkIsOutput = true`이면 Timer1을 이용해 이 노드가 CLK을 자동 출력합니다.
 - `SWP2P_BIND_ISRS(preset)`는 해당 `SWP2P<preset>` 특수화에 바인딩된 `ISR(INT0_vect)`, `ISR(INT1_vect)`, `ISR(TIMER1_CAPT_vect)` 정의로 전개됩니다. 실제 사용하는 preset에 대해 정확히 한 번만 호출하면 됩니다.
 
@@ -262,7 +263,7 @@ bool node.sendBurst(uint8_t destId, const uint8_t* buf, uint8_t len);
 ```
 
 - `send()`는 1바이트 전용 빠른 경로(LEN 필드 없음)입니다.
-- `sendBurst()`는 `len > 1`일 때 목적지 주소의 MSB에 burst 플래그가 자동으로 세팅되고, LEN 필드(`len-2` 인코딩)가 추가로 전송됩니다. `len`은 1~`SWP2P_MAX_BURST`(기본 16, 필요 시 늘릴 수 있음) 범위여야 합니다.
+- `sendBurst()`는 `len > 1`일 때 6비트 DEST와 6비트 SRC 뒤에 BURST 비트를 붙이고, `len-2`를 담은 압축 LEN 필드를 전송합니다. LEN의 유효 비트 수는 `SWP2P_MAX_BURST`에서 컴파일타임 계산 후 프리셋 폭에 맞춰 청크 단위로 올림합니다. `len`은 1~`SWP2P_MAX_BURST`(기본 16) 범위여야 합니다.
 - 이미 전송 중이거나(`isSending()`) 버스가 사용 중이면(`isBusy()`) `false`를 반환합니다.
 - `destId`로 `SWP2P<PRESET>::BROADCAST`를 사용하면 모든 노드에 브로드캐스트됩니다.
 - 목적지 노드가 실제로 ACK을 구동해야만 전송이 최종 성공으로 간주됩니다(아래 **상태 확인** / `isAckFailed()` 참고).
@@ -332,8 +333,8 @@ node.buffFree(buf, 2);
 
 ## 프로토콜 개요
 
-1. **ARB (중재)**: CLK 상승 에지마다 `dest`(1바이트, MSB=burst 플래그) + `src`(1바이트) 총 2바이트를 open-drain으로 구동하고, 하강 에지에 되읽어 비교합니다. 자신이 구동한 값보다 버스 값이 더 "0"에 가까우면(상대가 더 우선순위 높은 값을 구동 중이면) 즉시 양보하고 `TX_LOST` 상태로 전환, BUSY가 idle로 돌아오면 자동 재시도합니다. `TX_LOST` 상태에서도 RX 처리는 멈추지 않고 계속되어, 승자의 패킷이 자신에게 온 것일 경우를 놓치지 않습니다.
-2. **LEN (버스트일 때만)**: `len - 2` 값을 인코딩해 전송합니다(단일 바이트 전송에는 없는 단계).
+1. **ARB (중재)**: `DEST(6) + SRC(6) + BURST(1)`을 MSB부터 open-drain으로 보내고 각 하강 에지에서 되읽어 비교합니다. 필드는 프리셋 폭 청크 경계까지 0으로 패딩됩니다. 패배한 노드는 보낸 헤더 접두부를 복원해 승자 패킷 수신을 이어가고 BUSY idle 후 재시도합니다.
+2. **LEN (버스트일 때만)**: `SWP2P_MAX_BURST`에 필요한 최소 비트로 `len - 2`를 인코딩하고, 프리셋 폭의 청크 경계까지 0으로 패딩합니다(단일 바이트 전송에는 없습니다).
 3. **DATA**: 1바이트(단일 전송) 또는 `len`바이트(버스트)를 순서대로 전송합니다.
 4. **ACK**: 송신 측은 데이터선은 놓아주지만 BUSY는 계속 잡은 채, 목적지 노드가 ACK을 LOW로 구동하는지 제한된 클럭 엣지 수만큼 기다립니다. 제 시간에 ACK이 오면 전송 성공으로 처리되고, 못 받으면 타임아웃되어 다음 조회 시 `isAckFailed()`가 `true`를 반환합니다. 어느 쪽이든 대기가 끝나면 BUSY는 해제되어 다른 노드가 버스를 사용할 수 있습니다.
 
@@ -342,8 +343,9 @@ node.buffFree(buf, 2);
 ## 설계상 제약 / 주의사항
 
 - 데이터선은 반드시 풀업 저항이 있는 open-drain 구성이어야 합니다 (풀업이 없으면 통신 자체가 불가능함을 실측으로 확인).
-- 노드 ID는 0~126만 사용 가능하며, 127(`SWP2P_BROADCAST`)은 브로드캐스트 전용입니다.
-- `SWP2P_MAX_BURST`(기본 16)를 늘리면 이론상 최대 257바이트까지 버스트 전송이 가능하지만, RAM 사용량이 함께 증가합니다. `SWP2P_MAX_BURST`보다 큰 `CAP`으로 `SWP2PBuffer<CAP>`를 선언하면 컴파일 에러(`static_assert`)가 발생하며, 자동으로 여러 프레임에 나누어 전송되지 않습니다.
+- 노드 ID는 0~62이며, 63(`SWP2P_BROADCAST`)은 브로드캐스트 전용입니다. packed 13비트 헤더는 W1/W2에서 기존 16비트 헤더보다 각각 3/1클럭을 줄이고, W4/W8에서는 청크 올림 때문에 클럭 수가 같습니다.
+- `SWP2P_MAX_BURST`는 8비트 길이 API에 따라 최대 255입니다. LEN 비트 수는 이 설정에서 컴파일타임으로 계산됩니다. 버스트 최댓값을 키우면 LEN 비트와 TX 버퍼 RAM 사용량도 증가합니다. `CAP`이 `SWP2P_MAX_BURST`를 넘으면 컴파일 에러가 나며, 자동 분할하지 않습니다.
+- 새 packed header/LEN 형식은 이전 버전과 선로 호환되지 않으므로 한 버스의 모든 노드를 같은 형식으로 업데이트해야 합니다.
 - 클럭 주파수는 사용 환경(풀업 저항값, 배선, WIDTH 설정)에 따라 상한이 달라지므로 실측을 통해 조정하는 것을 권장합니다.
 
 ## 파일 구성

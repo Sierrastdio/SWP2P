@@ -75,6 +75,35 @@ struct SWP2PPresetTraits {
     static constexpr uint8_t TX_SHIFT  = 8 - DATA_WIDTH;
 };
 
+// The LEN value is len - 2, so the configured maximum burst determines the
+// number of meaningful LEN bits. Round its wire width up to whole data chunks.
+template <DataPreset PRESET, uint16_t MAX_BURST>
+struct SWP2PFrameTraits {
+    static_assert(MAX_BURST >= 1, "SWP2P_MAX_BURST must be at least 1");
+    static_assert(MAX_BURST <= 255, "SWP2P_MAX_BURST must fit in uint8_t");
+    static constexpr uint8_t LEN_BITS =
+        (MAX_BURST <= 3) ? 1 :
+        (MAX_BURST <= 5) ? 2 :
+        (MAX_BURST <= 9) ? 3 :
+        (MAX_BURST <= 17) ? 4 :
+        (MAX_BURST <= 33) ? 5 :
+        (MAX_BURST <= 65) ? 6 :
+        (MAX_BURST <= 129) ? 7 : 8;
+    static constexpr uint8_t LEN_CHUNKS =
+        (LEN_BITS + SWP2PPresetTraits<PRESET>::DATA_WIDTH - 1) /
+        SWP2PPresetTraits<PRESET>::DATA_WIDTH;
+    static constexpr uint8_t LEN_WIRE_BITS =
+        LEN_CHUNKS * SWP2PPresetTraits<PRESET>::DATA_WIDTH;
+    static constexpr uint8_t LEN_PADDING_BITS = LEN_WIRE_BITS - LEN_BITS;
+    static constexpr uint8_t ADDR_BITS = 13; // DEST(6) + SRC(6) + BURST(1)
+    static constexpr uint8_t ADDR_CHUNKS =
+        (ADDR_BITS + SWP2PPresetTraits<PRESET>::DATA_WIDTH - 1) /
+        SWP2PPresetTraits<PRESET>::DATA_WIDTH;
+    static constexpr uint8_t ADDR_WIRE_BITS =
+        ADDR_CHUNKS * SWP2PPresetTraits<PRESET>::DATA_WIDTH;
+    static constexpr uint8_t ADDR_PADDING_BITS = ADDR_WIRE_BITS - ADDR_BITS;
+};
+
 // ---- 프리셋별 핀 조작 (컴파일타임 특수화, 항상 인라인) ----
 
 // 데이터 핀 방향(DDR)을 통해 chunkVal(하위 DATA_WIDTH비트)을 open-drain으로 구동.
@@ -86,13 +115,13 @@ static inline void swp2p_driveDataChunk(uint8_t chunkVal) __attribute__((always_
 template <DataPreset PRESET>
 static inline void swp2p_driveDataChunk(uint8_t chunkVal) {
     // [DDR_reg] &= [BitMask_Clear] | [DataMask_Set] => 지정된 데이터 핀 방향 제어 (1:출력=0구동, 0:입력=하이임피던스)
-    if constexpr (PRESET == PRESET_W1_D4) { DDRD = (DDRD & ~(1 << DDD4)) | ((~chunkVal & 0x01) << 4); }
-    else if constexpr (PRESET == PRESET_W1_D5) { DDRD = (DDRD & ~(1 << DDD5)) | ((~chunkVal & 0x01) << 5); }
-    else if constexpr (PRESET == PRESET_W1_D6) { DDRD = (DDRD & ~(1 << DDD6)) | ((~chunkVal & 0x01) << 6); }
-    else if constexpr (PRESET == PRESET_W1_D7) { DDRD = (DDRD & ~(1 << DDD7)) | ((~chunkVal & 0x01) << 7); }
-    else if constexpr (PRESET == PRESET_W1_D9) { DDRB = (DDRB & ~(1 << DDB1)) | ((~chunkVal & 0x01) << 1); }
-    else if constexpr (PRESET == PRESET_W1_D10){ DDRB = (DDRB & ~(1 << DDB2)) | ((~chunkVal & 0x01) << 2); }
-    else if constexpr (PRESET == PRESET_W1_A0) { DDRC = (DDRC & ~(1 << DDC0)) | (~chunkVal & 0x01); }
+    if constexpr (PRESET == PRESET_W1_D4) { DDRD = (DDRD & ~_BV(DDD4)) | ((~chunkVal & 0x01) << 4); }
+    else if constexpr (PRESET == PRESET_W1_D5) { DDRD = (DDRD & ~_BV(DDD5)) | ((~chunkVal & 0x01) << 5); }
+    else if constexpr (PRESET == PRESET_W1_D6) { DDRD = (DDRD & ~_BV(DDD6)) | ((~chunkVal & 0x01) << 6); }
+    else if constexpr (PRESET == PRESET_W1_D7) { DDRD = (DDRD & ~_BV(DDD7)) | ((~chunkVal & 0x01) << 7); }
+    else if constexpr (PRESET == PRESET_W1_D9) { DDRB = (DDRB & ~_BV(DDB1)) | ((~chunkVal & 0x01) << 1); }
+    else if constexpr (PRESET == PRESET_W1_D10){ DDRB = (DDRB & ~_BV(DDB2)) | ((~chunkVal & 0x01) << 2); }
+    else if constexpr (PRESET == PRESET_W1_A0) { DDRC = (DDRC & ~_BV(DDC0)) | (~chunkVal & 0x01); }
     else if constexpr (PRESET == PRESET_W2_D4_D5) { DDRD = (DDRD & ~0x30) | ((~chunkVal & 0x03) << 4); }
     else if constexpr (PRESET == PRESET_W2_D6_D7) { DDRD = (DDRD & ~0xC0) | ((~chunkVal & 0x03) << 6); }
     else if constexpr (PRESET == PRESET_W2_D9_D10){ DDRB = (DDRB & ~0x06) | ((~chunkVal & 0x03) << 1); }
@@ -139,13 +168,13 @@ static inline void swp2p_dataRelease() __attribute__((always_inline));
 template <DataPreset PRESET>
 static inline void swp2p_dataRelease() {
     // [DDR_reg] &= ~(BitMask) => 데이터 핀을 모두 입력(High-Z)으로 해제
-    if constexpr (PRESET == PRESET_W1_D4) DDRD &= ~(1 << DDD4);
-    else if constexpr (PRESET == PRESET_W1_D5) DDRD &= ~(1 << DDD5);
-    else if constexpr (PRESET == PRESET_W1_D6) DDRD &= ~(1 << DDD6);
-    else if constexpr (PRESET == PRESET_W1_D7) DDRD &= ~(1 << DDD7);
-    else if constexpr (PRESET == PRESET_W1_D9) DDRB &= ~(1 << DDB1);
-    else if constexpr (PRESET == PRESET_W1_D10) DDRB &= ~(1 << DDB2);
-    else if constexpr (PRESET == PRESET_W1_A0) DDRC &= ~(1 << DDC0);
+    if constexpr (PRESET == PRESET_W1_D4) DDRD &= ~_BV(DDD4);
+    else if constexpr (PRESET == PRESET_W1_D5) DDRD &= ~_BV(DDD5);
+    else if constexpr (PRESET == PRESET_W1_D6) DDRD &= ~_BV(DDD6);
+    else if constexpr (PRESET == PRESET_W1_D7) DDRD &= ~_BV(DDD7);
+    else if constexpr (PRESET == PRESET_W1_D9) DDRB &= ~_BV(DDB1);
+    else if constexpr (PRESET == PRESET_W1_D10) DDRB &= ~_BV(DDB2);
+    else if constexpr (PRESET == PRESET_W1_A0) DDRC &= ~_BV(DDC0);
     else if constexpr (PRESET == PRESET_W2_D4_D5) DDRD &= ~0x30;
     else if constexpr (PRESET == PRESET_W2_D6_D7) DDRD &= ~0xC0;
     else if constexpr (PRESET == PRESET_W2_D9_D10) DDRB &= ~0x06;

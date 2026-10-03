@@ -72,13 +72,13 @@ void SWP2PBase::setupTimer1(unsigned long freq) {
     OCR1A = _freqToOcr(freq);
 
     // COM1A0 = 1 (비트 6 set) -> CTC 비교 일치 발생 시 OC1A(PB1 / Arduino D9) 핀 토글(Toggle)
-    // TCCR1A |= (1 << COM1A0) -> 0x40 (0100 0000)
-    TCCR1A |= (1 << COM1A0);
+    // TCCR1A |= _BV(COM1A0) -> 0x40 (0100 0000)
+    TCCR1A |= _BV(COM1A0);
 
     // WGM12 = 1 (비트 3 set) -> CTC 모드 설정 (TCNT1이 OCR1A에 도달하면 0으로 리셋)
     // CS10  = 1 (비트 0 set) -> 분주비 1 (No Prescaling, 클럭 직결)
-    // TCCR1B |= (1 << WGM12) | (1 << CS10) -> (1 << 3) | (1 << 0) = 0x08 | 0x01 = 0x09 (0000 1001)
-    TCCR1B |= (1 << WGM12) | (1 << CS10);
+    // TCCR1B |= _BV(WGM12) | _BV(CS10) -> (1 << 3) | (1 << 0) = 0x08 | 0x01 = 0x09 (0000 1001)
+    TCCR1B |= _BV(WGM12) | _BV(CS10);
 }
 
 void SWP2PBase::stopTimer1() {

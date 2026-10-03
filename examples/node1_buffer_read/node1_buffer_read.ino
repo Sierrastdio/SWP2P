@@ -54,7 +54,7 @@ void loop() {
             Serial.println(F("[Warning] Buffer Full! Cannot add more data."));
         }
 
-        delay(50); // Debounce delay
+        delay(10); // Debounce delay. high speed clock and long debounce delay could make broke data.
     }
     lastPinState = currentPinState;
 
