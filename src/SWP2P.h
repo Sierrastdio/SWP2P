@@ -41,9 +41,9 @@
 #define FLAG_ACK_FAILED   5   // 직전 송신이 ACK를 못 받고 타임아웃됐는지 (isAckFailed()로 조회)
 
 // GPIOR0 플래그 비트 연산 추적 주석 추가
-#define SET_FLAG(b) (GPIOR0 |= _BV(b))
-#define CLR_FLAG(b) (GPIOR0 &= ~_BV(b))
-#define GET_FLAG(b) (GPIOR0 & _BV(b))
+#define SET_FLAG(b) (GPIOR0 |= (1 << (b))) // 플래그 비트 b 마스크: 0000 0001 << b
+#define CLR_FLAG(b) (GPIOR0 &= ~(1 << (b))) // 플래그 비트 b 마스크: 0000 0001 << b
+#define GET_FLAG(b) (GPIOR0 & (1 << (b))) // 플래그 비트 b 마스크: 0000 0001 << b
 
 // DataPreset enum 및 Arduino 핀아웃 관련 내용은 SWP2PPreset.h로 이동됨
 
@@ -160,35 +160,35 @@ public:
         _ocrArb  = _freqToOcr(clkFreq);
         _ocrData = _freqToOcr(dataFreq != 0 ? dataFreq : clkFreq);
 
-        // DDRD2(0b00000100) 비트 0으로 클리어 (D2 입력 설정)
-        DDRD &= ~_BV(DDD2);   // [xxxx xxxx] &= [1111 1011] => [xxxx x0xx]
-        // PORTD2(0b00000100) 비트 0으로 클리어 (D2 풀업 해제)
-        PORTD &= ~_BV(PORTD2); // [xxxx xxxx] &= [1111 1011] => [xxxx x0xx]
+        // PD2 입력 설정: DDRD &= ~(1 << PD2)
+        DDRD &= ~(1 << PD2);   // PD2, bit 2: 0000 0100
+        // PD2 풀업 해제: PORTD &= ~(1 << PD2)
+        PORTD &= ~(1 << PD2); // PD2, bit 2: 0000 0100
 
-        PORTD &= ~_BV(PORTD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 출력 0)
-        DDRD &= ~_BV(DDD3);   // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 입력 설정)
-        PORTB &= ~_BV(PORTB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 출력 0)
-        DDRB &= ~_BV(DDB0);   // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 입력 설정)
+        PORTD &= ~(1 << PD3); // 마스크 PD3, bit 3: 0000 1000; D3 출력 0
+        DDRD &= ~(1 << PD3);   // 마스크 PD3, bit 3: 0000 1000; D3 입력 설정
+        PORTB &= ~(1 << PB0); // 마스크 PB0, bit 0: 0000 0001; PB0 출력 0
+        DDRB &= ~(1 << PB0);   // 마스크 PB0, bit 0: 0000 0001; PB0 입력 설정
 
         _dataRelease();
 
         if (clkIsOutput) {
-            DDRB |= _BV(DDB1); // [xxxx xxxx] |= [0000 0010] => [xxxx xx1x] (PB1 출력 설정)
+            DDRB |= (1 << PB1); // 마스크 PB1, bit 1: 0000 0010; PB1 출력 설정
             setupTimer1(clkFreq);
         } else {
-            TCCR1A = 0;
-            TCCR1B = _BV(CS10); // [0000 0000] = [0000 0001] (Timer1 분주비 1 설정)
+            TCCR1A = 0; // 초기화 마스크: 0000 0000
+            TCCR1B = (1 << CS10); // CS10, bit 0: 0000 0001 (Timer1 분주비 1 설정)
         }
 
         // TCCR1B: 노이즈 캔슬러(ICNC1) 및 엣지 세팅
-        TCCR1B |= _BV(ICNC1); // [xxxx xxxx] |= [1000 0000] => [1xxx xxxx] (노이즈 캔슬러 ON)
-        TCCR1B |= _BV(ICES1); // [xxxx xxxx] |= [0100 0000] => [x1xx xxxx] (Rising Edge 캡처)
-        TIMSK1 |= _BV(ICIE1); // [xxxx xxxx] |= [0010 0000] => [xx1x xxxx] (Capture 인터럽트 ON)
+        TCCR1B |= (1 << ICNC1); // ICNC1, bit 7: 1000 0000 (노이즈 캔슬러 ON)
+        TCCR1B |= (1 << ICES1); // ICES1, bit 6: 0100 0000 (Rising Edge 캡처)
+        TIMSK1 |= (1 << ICIE1); // ICIE1, bit 5: 0010 0000 (Capture 인터럽트 ON)
 
         // EICRA: INT0 설정 (ISC01, ISC00 비트)
-        EICRA &= ~(_BV(ISC01) | _BV(ISC00)); // [xxxx xxxx] &= [1111 0011] => [xxxx 00xx] (INT0 초기화)
-        EICRA |= _BV(ISC00);                   // [xxxx xxxx] |= [0000 0001] => [xxxx xx01] (INT0 Logical Change)
-        EIMSK |= _BV(INT0);                    // [xxxx xxxx] |= [0000 0001] => [xxxx xxx1] (INT0 Enable)
+        EICRA &= ~((1 << ISC01) | (1 << ISC00)); // ISC01: 0000 0010, ISC00: 0000 0001; 함께 0000 0011 (INT0 초기화)
+        EICRA |= (1 << ISC00); // ISC00, bit 0: 0000 0001 (INT0 Logical Change)
+        EIMSK |= (1 << INT0); // INT0, bit 0: 0000 0001 (INT0 Enable)
 
         // EICRA: INT1 설정 (ISC11, ISC10 비트)
         // 주의: Low Level(00)로 두면 D3(BUSY)가 LOW인 "동안"만 인터럽트가 걸리고, HIGH로
@@ -196,9 +196,9 @@ public:
         // idle 분기(FLAG_IS_BUSY를 푸는 유일한 지점)가 바로 그 상승 엣지에서 실행돼야
         // 하므로, Any Logical Change(01)로 바꿔서 양쪽 엣지를 모두 잡아야 한다.
         // (이게 없으면 최초 1회 통신 후 FLAG_IS_BUSY가 영구히 안 풀림 -> 이후 전송 전부 조용히 무시됨)
-        EICRA &= ~(_BV(ISC11) | _BV(ISC10)); // [xxxx xxxx] &= [1111 1100] => [xxxx xxxx] (INT1 초기화)
-        EICRA |= _BV(ISC10);                   // [xxxx xxxx] |= [0000 0100] => [xxxx x1xx] (INT1 Any Logical Change)
-        EIMSK |= _BV(INT1);                    // [xxxx xxxx] |= [0000 0010] => [xxxx xx1x] (INT1 Enable)
+        EICRA &= ~((1 << ISC11) | (1 << ISC10)); // ISC11: 0000 1000, ISC10: 0000 0100; 함께 0000 1100 (INT1 초기화)
+        EICRA |= (1 << ISC10); // ISC10, bit 2: 0000 0100 (INT1 Any Logical Change)
+        EIMSK |= (1 << INT1); // INT1, bit 1: 0000 0010 (INT1 Enable)
 
         sei();
     }
@@ -409,12 +409,12 @@ public:
     // ============================================================
     static void _onClkEdge() {
         // [PIND] & [0000 0100] => [0000 0x00] (CLK=PD2 하이 상태 확인)
-        bool clkHigh = (PIND & _BV(PIND2)) != 0;
+        bool clkHigh = (PIND & (1 << PD2)) != 0; // PD2, bit 2: 0000 0100
 
         if (clkHigh) {
             if (_txState == 1) { // TX_PENDING
-                PORTD &= ~_BV(PORTD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (D3 LOW)
-                DDRD |= _BV(DDD3);     // [xxxx xxxx] |= [0000 1000] => [xxxx 1xxx] (D3 BUSY 출력 켜서 라인 점유)
+                PORTD &= ~(1 << PD3); // 마스크 PD3, bit 3: 0000 1000 (D3 LOW)
+                DDRD |= (1 << PD3);     // 마스크 PD3, bit 3: 0000 1000 (D3 BUSY 출력 켜서 라인 점유)
 
                 uint16_t header =
                     ((uint16_t)(_txDestId & SWP2P_NODE_MASK) << 7) |
@@ -516,16 +516,16 @@ public:
             //  직접 처리하게 되면서 더 이상 쓰이지 않음 - falling-edge 쪽 state7 핸들러 참고)
         } else {
             if (_txState == 7) { // [버그4 수정] TX_WAIT_ACK negedge: ACK(PB0=D8) 확인
-                bool acked = (PINB & _BV(PINB0)) == 0; // 수신측이 PB0을 LOW로 구동했는지
+                bool acked = (PINB & (1 << PB0)) == 0; // 마스크 PB0, bit 0: 0000 0001; 수신측이 LOW로 구동했는지
                 if (acked) {
                     CLR_FLAG(FLAG_ACK_FAILED);
-                    DDRD &= ~_BV(DDD3); // BUSY 해제
+                    DDRD &= ~(1 << PD3); // 마스크 PD3, bit 3: 0000 1000; BUSY 해제
                     CLR_FLAG(FLAG_IS_SENDING);
                     _txState = 0;
                 } else if (_ackWaitCount == 0) {
                     // 타임아웃: ACK 못 받았지만 버스는 풀어줘야 다른 노드가 계속 쓸 수 있음
                     SET_FLAG(FLAG_ACK_FAILED);
-                    DDRD &= ~_BV(DDD3);
+                    DDRD &= ~(1 << PD3); // 마스크 PD3, bit 3: 0000 1000
                     CLR_FLAG(FLAG_IS_SENDING);
                     _txState = 0;
                 } else {
@@ -538,7 +538,7 @@ public:
                 // [내가 보낸 비트] & ~[버스의 실제 비트] => 내가 0(구동)인데 버스가 1이면 충돌(패배)
                 if ((_arbMyChunk & ~busVal) != 0) {
                     _dataRelease();
-                    DDRD &= ~_BV(DDD3); // [xxxx xxxx] &= [1111 0111] => [xxxx 0xxx] (BUSY 해제 - 내 쪽만. 승자가 계속 잡고있으므로 버스 자체는 그대로 busy)
+                    DDRD &= ~(1 << PD3); // 마스크 PD3, bit 3: 0000 1000; BUSY 해제 - 내 쪽만
                     CLR_FLAG(FLAG_IS_SENDING);
 
                     // [버그1 수정] 중재 패배 = 지금 이 순간 "더 높은 우선순위 노드가 주소 필드를
@@ -651,8 +651,8 @@ public:
                 // [버그4 전제 수정] 원래는 addressing 여부와 무관하게 무조건 ACK를 쏴서,
                 // 모든 리슨 노드가 매 패킷마다 ACK를 구동했음(= ACK가 "내가 받았다"는 증거로 쓸모없었음).
                 // 실제 목적지였던 노드만 ACK를 구동하도록 게이트.
-                PORTB &= ~_BV(PORTB0);
-                DDRB |= _BV(DDB0);
+                PORTB &= ~(1 << PB0); // 마스크 PB0, bit 0: 0000 0001
+                DDRB |= (1 << PB0); // 마스크 PB0, bit 0: 0000 0001
                 _rxState = 0;
             }
         }
@@ -660,10 +660,10 @@ public:
 
     static void _onBusyEdge() {
         // [PIND] & [0000 1000] => [0000 x000] (BUSY=PD3 상태 확인)
-        bool idle = (PIND & _BV(PIND3)) != 0;
+        bool idle = (PIND & (1 << PD3)) != 0; // PD3, bit 3: 0000 1000
         if (idle) {
             CLR_FLAG(FLAG_IS_BUSY);
-            DDRB &= ~_BV(DDB0); // [xxxx xxxx] &= [1111 1110] => [xxxx xxx0] (PB0 입력/해제)
+            DDRB &= ~(1 << PB0); // 마스크 PB0, bit 0: 0000 0001 (PB0 입력/해제)
             // 방어적 backstop: ARB/DATA 전환 훅을 어디선가 놓쳤더라도(버그, 예외 경로 등)
             // 버스가 idle로 돌아오는 시점엔 무조건 저속(ARB 안전속도)으로 맞춰둔다.
             _clkGoSlow();
@@ -689,7 +689,7 @@ public:
 
     static void _onAckCapture() {
         // [TCCR1B] ^= [0100 0000] => ICES1( bit6 ) 반전 (Rising Edge <-> Falling Edge 캡처 극성 토글)
-        TCCR1B ^= _BV(ICES1);
+        TCCR1B ^= (1 << ICES1); // ICES1, bit 6: 0100 0000
     }
 };
 

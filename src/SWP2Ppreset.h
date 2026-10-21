@@ -115,23 +115,23 @@ static inline void swp2p_driveDataChunk(uint8_t chunkVal) __attribute__((always_
 template <DataPreset PRESET>
 static inline void swp2p_driveDataChunk(uint8_t chunkVal) {
     // [DDR_reg] &= [BitMask_Clear] | [DataMask_Set] => 지정된 데이터 핀 방향 제어 (1:출력=0구동, 0:입력=하이임피던스)
-    if constexpr (PRESET == PRESET_W1_D4) { DDRD = (DDRD & ~_BV(DDD4)) | ((~chunkVal & 0x01) << 4); }
-    else if constexpr (PRESET == PRESET_W1_D5) { DDRD = (DDRD & ~_BV(DDD5)) | ((~chunkVal & 0x01) << 5); }
-    else if constexpr (PRESET == PRESET_W1_D6) { DDRD = (DDRD & ~_BV(DDD6)) | ((~chunkVal & 0x01) << 6); }
-    else if constexpr (PRESET == PRESET_W1_D7) { DDRD = (DDRD & ~_BV(DDD7)) | ((~chunkVal & 0x01) << 7); }
-    else if constexpr (PRESET == PRESET_W1_D9) { DDRB = (DDRB & ~_BV(DDB1)) | ((~chunkVal & 0x01) << 1); }
-    else if constexpr (PRESET == PRESET_W1_D10){ DDRB = (DDRB & ~_BV(DDB2)) | ((~chunkVal & 0x01) << 2); }
-    else if constexpr (PRESET == PRESET_W1_A0) { DDRC = (DDRC & ~_BV(DDC0)) | (~chunkVal & 0x01); }
-    else if constexpr (PRESET == PRESET_W2_D4_D5) { DDRD = (DDRD & ~0x30) | ((~chunkVal & 0x03) << 4); }
-    else if constexpr (PRESET == PRESET_W2_D6_D7) { DDRD = (DDRD & ~0xC0) | ((~chunkVal & 0x03) << 6); }
-    else if constexpr (PRESET == PRESET_W2_D9_D10){ DDRB = (DDRB & ~0x06) | ((~chunkVal & 0x03) << 1); }
-    else if constexpr (PRESET == PRESET_W2_A0_A1) { DDRC = (DDRC & ~0x03) | (~chunkVal & 0x03); }
-    else if constexpr (PRESET == PRESET_W4_D4_D7) { DDRD = (DDRD & ~0xF0) | ((~chunkVal & 0x0F) << 4); }
-    else if constexpr (PRESET == PRESET_W4_A0_A3) { DDRC = (DDRC & ~0x0F) | (~chunkVal & 0x0F); }
-    else if constexpr (PRESET == PRESET_W4_D9_D12) { DDRB = (DDRB & ~0x1E) | ((~chunkVal & 0x0F) << 1); }
+    if constexpr (PRESET == PRESET_W1_D4) { DDRD = (DDRD & ~(1 << PD4)) | ((~chunkVal & 0x01) << 4); } // PD4, bit 4: 0001 0000
+    else if constexpr (PRESET == PRESET_W1_D5) { DDRD = (DDRD & ~(1 << PD5)) | ((~chunkVal & 0x01) << 5); } // PD5, bit 5: 0010 0000
+    else if constexpr (PRESET == PRESET_W1_D6) { DDRD = (DDRD & ~(1 << PD6)) | ((~chunkVal & 0x01) << 6); } // PD6, bit 6: 0100 0000
+    else if constexpr (PRESET == PRESET_W1_D7) { DDRD = (DDRD & ~(1 << PD7)) | ((~chunkVal & 0x01) << 7); } // PD7, bit 7: 1000 0000
+    else if constexpr (PRESET == PRESET_W1_D9) { DDRB = (DDRB & ~(1 << PB1)) | ((~chunkVal & 0x01) << 1); } // PB1, bit 1: 0000 0010
+    else if constexpr (PRESET == PRESET_W1_D10){ DDRB = (DDRB & ~(1 << PB2)) | ((~chunkVal & 0x01) << 2); } // PB2, bit 2: 0000 0100
+    else if constexpr (PRESET == PRESET_W1_A0) { DDRC = (DDRC & ~(1 << PC0)) | (~chunkVal & 0x01); } // PC0, bit 0: 0000 0001
+    else if constexpr (PRESET == PRESET_W2_D4_D5) { DDRD = (DDRD & ~0x30) | ((~chunkVal & 0x03) << 4); } // PD4-PD5: 0011 0000
+    else if constexpr (PRESET == PRESET_W2_D6_D7) { DDRD = (DDRD & ~0xC0) | ((~chunkVal & 0x03) << 6); } // PD6-PD7: 1100 0000
+    else if constexpr (PRESET == PRESET_W2_D9_D10){ DDRB = (DDRB & ~0x06) | ((~chunkVal & 0x03) << 1); } // PB1-PB2: 0000 0110
+    else if constexpr (PRESET == PRESET_W2_A0_A1) { DDRC = (DDRC & ~0x03) | (~chunkVal & 0x03); } // PC0-PC1: 0000 0011
+    else if constexpr (PRESET == PRESET_W4_D4_D7) { DDRD = (DDRD & ~0xF0) | ((~chunkVal & 0x0F) << 4); } // PD4-PD7: 1111 0000
+    else if constexpr (PRESET == PRESET_W4_A0_A3) { DDRC = (DDRC & ~0x0F) | (~chunkVal & 0x0F); } // PC0-PC3: 0000 1111
+    else if constexpr (PRESET == PRESET_W4_D9_D12) { DDRB = (DDRB & ~0x1E) | ((~chunkVal & 0x0F) << 1); } // PB1-PB4: 0001 1110
     else if constexpr (PRESET == PRESET_W8_A0_D7) {
-        DDRC = (DDRC & ~0x0F) | (~chunkVal & 0x0F);
-        DDRD = (DDRD & ~0xF0) | ((~chunkVal & 0xF0));
+        DDRC = (DDRC & ~0x0F) | (~chunkVal & 0x0F); // PC0-PC3 마스크: 0000 1111
+        DDRD = (DDRD & ~0xF0) | ((~chunkVal & 0xF0)); // PD4-PD7 마스크: 1111 0000
     }
 }
 
@@ -143,21 +143,21 @@ template <DataPreset PRESET>
 static inline uint8_t swp2p_readDataChunk() {
     uint8_t val = 0;
     // [PIN_reg] >> [Shift] & [BitMask] => 데이터 핀 상태만 0~N 비트 크기로 정렬하여 수신
-    if constexpr (PRESET == PRESET_W1_D4)   val = (PIND >> PIND4) & 0x01;
-    else if constexpr (PRESET == PRESET_W1_D5)  val = (PIND >> PIND5) & 0x01;
-    else if constexpr (PRESET == PRESET_W1_D6)  val = (PIND >> PIND6) & 0x01;
-    else if constexpr (PRESET == PRESET_W1_D7)  val = (PIND >> PIND7) & 0x01;
-    else if constexpr (PRESET == PRESET_W1_D9)  val = (PINB >> PINB1) & 0x01;
-    else if constexpr (PRESET == PRESET_W1_D10) val = (PINB >> PINB2) & 0x01;
-    else if constexpr (PRESET == PRESET_W1_A0)  val = (PINC >> PINC0) & 0x01;
-    else if constexpr (PRESET == PRESET_W2_D4_D5) val = (PIND & 0x30) >> 4;
-    else if constexpr (PRESET == PRESET_W2_D6_D7) val = (PIND & 0xC0) >> 6;
-    else if constexpr (PRESET == PRESET_W2_D9_D10)val = (PINB & 0x06) >> 1;
-    else if constexpr (PRESET == PRESET_W2_A0_A1) val = (PINC & 0x03);
-    else if constexpr (PRESET == PRESET_W4_D4_D7) val = (PIND & 0xF0) >> 4;
-    else if constexpr (PRESET == PRESET_W4_A0_A3) val = (PINC & 0x0F);
-    else if constexpr (PRESET == PRESET_W4_D9_D12) val = (PINB & 0x1E) >> 1;
-    else if constexpr (PRESET == PRESET_W8_A0_D7) val = (PINC & 0x0F) | (PIND & 0xF0);
+    if constexpr (PRESET == PRESET_W1_D4)   val = (PIND >> PD4) & 0x01; // PD4, bit 4: 0001 0000
+    else if constexpr (PRESET == PRESET_W1_D5)  val = (PIND >> PD5) & 0x01; // PD5, bit 5: 0010 0000
+    else if constexpr (PRESET == PRESET_W1_D6)  val = (PIND >> PD6) & 0x01; // PD6, bit 6: 0100 0000
+    else if constexpr (PRESET == PRESET_W1_D7)  val = (PIND >> PD7) & 0x01; // PD7, bit 7: 1000 0000
+    else if constexpr (PRESET == PRESET_W1_D9)  val = (PINB >> PB1) & 0x01; // PB1, bit 1: 0000 0010
+    else if constexpr (PRESET == PRESET_W1_D10) val = (PINB >> PB2) & 0x01; // PB2, bit 2: 0000 0100
+    else if constexpr (PRESET == PRESET_W1_A0)  val = (PINC >> PC0) & 0x01; // PC0, bit 0: 0000 0001
+    else if constexpr (PRESET == PRESET_W2_D4_D5) val = (PIND & 0x30) >> 4; // PD4-PD5: 0011 0000
+    else if constexpr (PRESET == PRESET_W2_D6_D7) val = (PIND & 0xC0) >> 6; // PD6-PD7: 1100 0000
+    else if constexpr (PRESET == PRESET_W2_D9_D10)val = (PINB & 0x06) >> 1; // PB1-PB2: 0000 0110
+    else if constexpr (PRESET == PRESET_W2_A0_A1) val = (PINC & 0x03); // PC0-PC1: 0000 0011
+    else if constexpr (PRESET == PRESET_W4_D4_D7) val = (PIND & 0xF0) >> 4; // PD4-PD7: 1111 0000
+    else if constexpr (PRESET == PRESET_W4_A0_A3) val = (PINC & 0x0F); // PC0-PC3: 0000 1111
+    else if constexpr (PRESET == PRESET_W4_D9_D12) val = (PINB & 0x1E) >> 1; // PB1-PB4: 0001 1110
+    else if constexpr (PRESET == PRESET_W8_A0_D7) val = (PINC & 0x0F) | (PIND & 0xF0); // PC0-PC3: 0000 1111; PD4-PD7: 1111 0000
     return val;
 }
 
@@ -168,21 +168,21 @@ static inline void swp2p_dataRelease() __attribute__((always_inline));
 template <DataPreset PRESET>
 static inline void swp2p_dataRelease() {
     // [DDR_reg] &= ~(BitMask) => 데이터 핀을 모두 입력(High-Z)으로 해제
-    if constexpr (PRESET == PRESET_W1_D4) DDRD &= ~_BV(DDD4);
-    else if constexpr (PRESET == PRESET_W1_D5) DDRD &= ~_BV(DDD5);
-    else if constexpr (PRESET == PRESET_W1_D6) DDRD &= ~_BV(DDD6);
-    else if constexpr (PRESET == PRESET_W1_D7) DDRD &= ~_BV(DDD7);
-    else if constexpr (PRESET == PRESET_W1_D9) DDRB &= ~_BV(DDB1);
-    else if constexpr (PRESET == PRESET_W1_D10) DDRB &= ~_BV(DDB2);
-    else if constexpr (PRESET == PRESET_W1_A0) DDRC &= ~_BV(DDC0);
-    else if constexpr (PRESET == PRESET_W2_D4_D5) DDRD &= ~0x30;
-    else if constexpr (PRESET == PRESET_W2_D6_D7) DDRD &= ~0xC0;
-    else if constexpr (PRESET == PRESET_W2_D9_D10) DDRB &= ~0x06;
-    else if constexpr (PRESET == PRESET_W2_A0_A1) DDRC &= ~0x03;
-    else if constexpr (PRESET == PRESET_W4_D4_D7) DDRD &= ~0xF0;
-    else if constexpr (PRESET == PRESET_W4_A0_A3) DDRC &= ~0x0F;
-    else if constexpr (PRESET == PRESET_W4_D9_D12) DDRB &= ~0x1E;
-    else if constexpr (PRESET == PRESET_W8_A0_D7) { DDRC &= ~0x0F; DDRD &= ~0xF0; }
+    if constexpr (PRESET == PRESET_W1_D4) DDRD &= ~(1 << PD4); // PD4, bit 4: 0001 0000
+    else if constexpr (PRESET == PRESET_W1_D5) DDRD &= ~(1 << PD5); // PD5, bit 5: 0010 0000
+    else if constexpr (PRESET == PRESET_W1_D6) DDRD &= ~(1 << PD6); // PD6, bit 6: 0100 0000
+    else if constexpr (PRESET == PRESET_W1_D7) DDRD &= ~(1 << PD7); // PD7, bit 7: 1000 0000
+    else if constexpr (PRESET == PRESET_W1_D9) DDRB &= ~(1 << PB1); // PB1, bit 1: 0000 0010
+    else if constexpr (PRESET == PRESET_W1_D10) DDRB &= ~(1 << PB2); // PB2, bit 2: 0000 0100
+    else if constexpr (PRESET == PRESET_W1_A0) DDRC &= ~(1 << PC0); // PC0, bit 0: 0000 0001
+    else if constexpr (PRESET == PRESET_W2_D4_D5) DDRD &= ~0x30; // PD4-PD5 마스크: 0011 0000
+    else if constexpr (PRESET == PRESET_W2_D6_D7) DDRD &= ~0xC0; // PD6-PD7 마스크: 1100 0000
+    else if constexpr (PRESET == PRESET_W2_D9_D10) DDRB &= ~0x06; // PB1-PB2 마스크: 0000 0110
+    else if constexpr (PRESET == PRESET_W2_A0_A1) DDRC &= ~0x03; // PC0-PC1 마스크: 0000 0011
+    else if constexpr (PRESET == PRESET_W4_D4_D7) DDRD &= ~0xF0; // PD4-PD7 마스크: 1111 0000
+    else if constexpr (PRESET == PRESET_W4_A0_A3) DDRC &= ~0x0F; // PC0-PC3 마스크: 0000 1111
+    else if constexpr (PRESET == PRESET_W4_D9_D12) DDRB &= ~0x1E; // PB1-PB4 마스크: 0001 1110
+    else if constexpr (PRESET == PRESET_W8_A0_D7) { DDRC &= ~0x0F; DDRD &= ~0xF0; } // PC0-PC3: 0000 1111; PD4-PD7: 1111 0000
 }
 
 #endif
