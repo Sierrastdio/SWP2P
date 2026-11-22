@@ -35,9 +35,13 @@ uint16_t SWP2PBase::_txArbReg = 0;
 uint8_t SWP2PBase::_txDataReg = 0;
 uint8_t SWP2PBase::_arbChunkCount = 0;
 uint8_t SWP2PBase::_txDataChunkCount = 0;
-uint8_t SWP2PBase::_arbMyChunk = 0;
-uint8_t SWP2PBase::_arbChunksSent = 0; // [버그1 수정]
 uint8_t SWP2PBase::_ackWaitCount = 0;  // [버그4 수정]
+
+uint8_t SWP2PBase::_slotCounter = 0;   // 슬롯 중재 카운터 (idle 시 CLK 상승 에지마다 증가)
+#if SWP2P_ROUND_ROBIN
+uint8_t SWP2PBase::_slotBase = 0;
+uint8_t SWP2PBase::_lastSenderId = 0;
+#endif
 
 // ---- Dynamic Clock Scaling ----
 volatile bool SWP2PBase::_isClkMaster = false;

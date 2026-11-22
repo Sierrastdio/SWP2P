@@ -22,11 +22,17 @@
 #include <avr/interrupt.h>
 #include <util/atomic.h>
 #include "SWP2PBuffer.h"
-#include "SWP2PPreset.h" // DataPreset enum, 프리셋별 핀 조작(_driveDataChunk 등), WIDTH 관련 상수는 전부 여기로 이동됨
+#include "SWP2PPreset.h" // DataPreset enum, 프리셋별 핀 조작(_driveFrameChunk 등), WIDTH 관련 상수는 전부 여기로 이동됨
 
 #define SWP2P_FIFO_DEPTH 16
 #define SWP2P_MAX_BURST   16  // TX buffer capacity; LEN width is derived at compile time (1..255).
                               // RAM 절약 위해 우선 16으로 제한 (필요시 늘리면 됨).
+#define SWP2P_MAX_SLOTS   63  // 슬롯 중재 최대 슬롯 수 (최대 노드 ID와 동일: 0~62)
+
+// 라운드로빈 공정성 옵션 (0: 고정 ID 슬롯 우선순위, 1: 직전 송신 노드 다음 노드부터 슬롯 시작)
+#ifndef SWP2P_ROUND_ROBIN
+#define SWP2P_ROUND_ROBIN 0
+#endif
 
 // ---- 주소 인코딩 ----
 // Wire header is DEST(6), SRC(6), BURST(1), MSB first; IDs 0..62, 63 broadcast.
@@ -48,7 +54,7 @@
 // DataPreset enum 및 Arduino 핀아웃 관련 내용은 SWP2PPreset.h로 이동됨
 
 // ---- Tx/Rx 상태 번호 ----
-// Tx: 0 IDLE, 1 PENDING, 2 ARB, 3 LEN, 4 DATA, 6 LOST, 7 WAIT_ACK
+// Tx: 0 IDLE, 1 PENDING, 2 HEADER, 3 LEN, 4 DATA, 7 WAIT_ACK
 // Rx: 0 IDLE/filtered, 1 packed header, 3 LEN, 4 addressed DATA, 5 ACK, 6 clock-master discard
 
 class SWP2PBase {
@@ -73,13 +79,17 @@ public:
     // send()/read()/isSending() 등 공개 API나 메인 루프가 동시에 건드리는 일이 없으므로
     // volatile을 뗐다 - volatile이 붙으면 같은 함수 안에서도 매번 SRAM으로 다시 읽고/쓰게
     // 강제되어(레지스터 캐싱 금지) 에지마다 불필요한 load/store가 늘어난다.
-    static uint16_t _txArbReg;
+    static uint16_t _txArbReg;     // 헤더 push-pull 송신 시 남은 비트를 보관하는 시프트 레지스터
     static uint8_t _txDataReg;   // data byte or left-aligned LEN bits
     static uint8_t _arbChunkCount;
     static uint8_t _txDataChunkCount;
-    static uint8_t _arbMyChunk;
-    static uint8_t _arbChunksSent; // [버그1 수정] 이번 중재 라운드에서 "드라이브+비교까지 끝난" 청크 수(이번 것 포함)
     static uint8_t _ackWaitCount;  // [버그4 수정] ACK 대기 중 남은 edge 수 (0이면 타임아웃)
+
+    static uint8_t _slotCounter;   // 슬롯 중재: 버스 idle 중 CLK 상승 에지마다 증가, idle 복귀 시 리셋
+#if SWP2P_ROUND_ROBIN
+    static uint8_t _slotBase;      // 라운드로빈 슬롯 시작 오프셋
+    static uint8_t _lastSenderId;  // 직전 프레임 송신자 ID
+#endif
 
     static uint8_t _rxAddrByte; // high byte of the packed 13-bit arbitration header
     static uint8_t _rxSrcByte;
@@ -97,7 +107,7 @@ public:
     // 하드웨어 자동 토글)뿐이다. 나머지 노드는 CLK을 그냥 받아서 따라갈 뿐이라 여기서 아무것도
     // 할 수 없다 - 그래서 _isClkMaster가 false면 _clkGoFast/_clkGoSlow는 완전한 no-op이어야 한다.
     static volatile bool _isClkMaster;
-    static uint16_t _ocrArb;   // ARB(중재)/ACK 구간용 저속 OCR1A (안전 최우선)
+    static uint16_t _ocrArb;   // HEADER(슬롯 중재)/ACK 구간용 저속 OCR1A (안전 최우선)
     static uint16_t _ocrData; // DATA(페이로드) 구간용 고속 OCR1A (실측으로 튜닝해서 넣을 값)
 
     // freq(Hz) -> OCR1A 값 변환. setupTimer1()의 공식과 동일해야 한다(분주비 1 고정 전제).
@@ -115,17 +125,14 @@ public:
         return (uint16_t)(raw - 1UL);
     }
 
-    // ARB(중재)가 끝나고 LEN/DATA로 넘어가는 그 순간(=에지 ISR 진입 직후, TCNT1이 막 0으로
-    // 리셋된 시점) 호출한다. [강화] 그런데 이 지점까지 도달하는 코드 경로가 짧을 수도(정상
-    // 경로) 길 수도(중재 충돌 핸드오프처럼 계산이 많은 경로) 있어서, ISR 진입 후 여기 도달할
-    // 때까지 이미 TCNT1이 새 OCR1A 값보다 커져 있으면 다음 매치까지 65536카운트를 통째로
-    // 돌아야 하는 수 ms짜리 글리치가 생길 수 있다. TCNT1을 여기서 같이 0으로 리셋해주면
+    // HEADER(슬롯 중재) 완료 후 LEN/DATA로 넘어가는 그 순간(=에지 ISR 진입 직후, TCNT1이 막 0으로
+    // 리셋된 시점) 호출한다. TCNT1을 여기서 같이 0으로 리셋해주면
     // ISR 진입~여기 도달 시간과 무관하게 항상 "지금부터 정확히 새 주기"가 보장된다.
     static inline void _clkGoFast() __attribute__((always_inline)) {
         if (_isClkMaster) { OCR1A = _ocrData; TCNT1 = 0; }
     }
     // DATA가 끝나고 ACK/유휴로 돌아가는 순간, 그리고 버스 idle 리셋 시점에 호출해서 항상
-    // ARB에 안전한 저속으로 복귀시킨다. (위와 동일한 이유로 TCNT1도 같이 리셋)
+    // HEADER에 안전한 저속으로 복귀시킨다. (위와 동일한 이유로 TCNT1도 같이 리셋)
     static inline void _clkGoSlow() __attribute__((always_inline)) {
         if (_isClkMaster) { OCR1A = _ocrArb; TCNT1 = 0; }
     }
@@ -145,7 +152,7 @@ public:
 
     // dataFreq를 생략하면(0) clkFreq와 동일하게 취급되어 기존과 완전히 동일하게 동작한다
     // (=동적 클럭 기능을 켜지 않은 기존 사용자 코드는 아무 영향 없음).
-    // dataFreq를 지정하면: ARB/ACK 구간은 clkFreq(저속, 안전 우선), DATA(페이로드) 구간만
+    // dataFreq를 지정하면: HEADER/ACK 구간은 clkFreq(저속, 안전 우선), DATA(페이로드) 구간만
     // dataFreq(고속)로 잠깐 가속했다가 ACK 대기에 들어가는 순간 다시 clkFreq로 돌아온다.
     // dataFreq 값은 "이론상 최댓값"이 아니라 실측으로 정해야 한다 - 이 버스에 붙은 노드 중
     // 가장 느린 노드(WIDTH가 넓을수록, ISR이 무거울수록 느림)가 감내 못하면 에지를 놓쳐
@@ -172,7 +179,20 @@ public:
 
         _frameDataRelease();
 
+        _slotCounter = 0;
+#if SWP2P_ROUND_ROBIN
+        _slotBase = 0;
+        _lastSenderId = 0;
+#endif
+
         if (clkIsOutput) {
+            // 안전 가드: D9(PB1)를 데이터 핀으로 사용하는 프리셋은 Timer1 OC1A(PB1) 출력과
+            // 핀이 겹치므로 CLK 마스터로 동작할 수 없음 (슬레이브 begin(false)로만 사용 가능)
+            // PRESET은 템플릿 상수라 최적화 시 상수 조건으로 접힌다. if constexpr는
+            // Arduino AVR 기본 gnu++11 설정에서 컴파일되지 않으므로 일반 if를 사용한다.
+            if (PRESET == PRESET_W1_D9 || PRESET == PRESET_W2_D9_D10 || PRESET == PRESET_W4_D9_D12) {
+                return;
+            }
             DDRB |= (1 << PB1); // 마스크 PB1, bit 1: 0000 0010; PB1 출력 설정
             setupTimer1(clkFreq);
         } else {
@@ -400,6 +420,9 @@ public:
             return;
         }
         _rxSrcByte = (header >> 1) & SWP2P_NODE_MASK;
+#if SWP2P_ROUND_ROBIN
+        _lastSenderId = _rxSrcByte;
+#endif
         _rxDataByte = 0;
         _rxByteIdx = 0;
         if (isBurst) {
@@ -420,36 +443,57 @@ public:
         bool clkHigh = (PIND & (1 << PD2)) != 0; // PD2, bit 2: 0000 0100
 
         if (clkHigh) {
+            // --- 슬롯 중재: TX_PENDING(1) 노드가 자기 슬롯에 도달하면 버스를 점유 ---
             if (_txState == 1) { // TX_PENDING
-                PORTD &= ~(1 << PD3); // 마스크 PD3, bit 3: 0000 1000 (D3 LOW)
-                DDRD |= (1 << PD3);     // 마스크 PD3, bit 3: 0000 1000 (D3 BUSY 출력 켜서 라인 점유)
+                if (_slotCounter == _nodeId) {
+                    // BUSY(PD3)가 아직 HIGH(idle)인지 확인
+                    if ((PIND & (1 << PD3)) != 0) { // PD3, bit 3: 0000 1000
+                        // 버스 점유: BUSY를 LOW로 구동 (open-drain assert)
+                        PORTD &= ~(1 << PD3); // 마스크 PD3, bit 3: 0000 1000 (D3 LOW)
+                        DDRD |= (1 << PD3);     // 마스크 PD3, bit 3: 0000 1000 (D3 BUSY 출력 켜서 라인 점유)
+                        SET_FLAG(FLAG_IS_BUSY); // 송신 노드 자신도 즉시 BUSY 플래그 세팅
+#if SWP2P_ROUND_ROBIN
+                        _lastSenderId = _nodeId;
+#endif
 
-                uint16_t header =
-                    ((uint16_t)(_txDestId & SWP2P_NODE_MASK) << 7) |
-                    ((uint16_t)_nodeId << 1) |
-                    ((_txDestId & SWP2P_BURST_BIT) ? 1 : 0);
-                uint16_t arbReg = header << (16 - FrameTraits::ADDR_BITS);
-                uint8_t myChunk = (arbReg >> ARB_SHIFT) & DATA_MASK;
-                arbReg <<= DATA_WIDTH;
-                _driveDataChunk(myChunk);
-                _txArbReg = arbReg;
-                _arbMyChunk = myChunk;
-                _arbChunksSent = 1; // [버그1 수정] 이번이 첫 청크
-                _arbChunkCount = ADDR_CHUNKS - 1;
-                _txState = 2; // TX_ARB
-                return;
+                        // 헤더 조립: DEST(6) + SRC(6) + BURST(1) = 13비트, MSB first
+                        uint16_t header =
+                            ((uint16_t)(_txDestId & SWP2P_NODE_MASK) << 7) |
+                            ((uint16_t)_nodeId << 1) |
+                            ((_txDestId & SWP2P_BURST_BIT) ? 1 : 0);
+                        uint16_t headerReg = header << (16 - FrameTraits::ADDR_BITS);
+
+                        // 첫 청크를 push-pull로 구동
+                        uint8_t chunk = (headerReg >> ARB_SHIFT) & DATA_MASK;
+                        headerReg <<= DATA_WIDTH;
+                        _driveFrameChunk(chunk); // push-pull 구동!
+                        _txArbReg = headerReg;   // 남은 헤더 비트 보관
+                        _arbChunkCount = ADDR_CHUNKS - 1;
+                        _txState = 2; // TX_HEADER
+                        return;
+                    }
+                    // else: BUSY가 이미 LOW → 다른 노드가 먼저 점유, PENDING 유지하고 다음 idle 대기
+                }
             }
 
-            if (_txState == 2) { // TX_ARB
+            // 버스가 idle이고 송신 중이 아닐 때만 슬롯 카운터 증가
+            if ((PIND & (1 << PD3)) != 0 && _txState < 2) {
+                _slotCounter++;
+                if (_slotCounter >= SWP2P_MAX_SLOTS) _slotCounter = 0;
+            }
+
+            // --- TX_HEADER(2): 헤더를 push-pull로 계속 전송 ---
+            if (_txState == 2) {
                 uint8_t chunkCnt = _arbChunkCount;
                 if (chunkCnt == 0) {
+                    // 헤더 전송 완료 → LEN 또는 DATA로 전이
                     if (_txLen > 1) {
                         _txDataReg = (_txLen - 2) << (8 - LEN_BITS);
                         _txDataChunkCount = LEN_CHUNKS;
                         // [시프트 & DATA_MASK] MSB 비트들을 하위로 내린 후 2^N-1 마스크로 필요 크기만 추출
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
                         _txDataReg <<= DATA_WIDTH;
-                        _clkGoFast(); // ARB 끝, LEN부터는 페이로드 구간으로 취급해 가속
+                        _clkGoFast(); // HEADER 끝, LEN부터는 페이로드 구간으로 취급해 가속
                         _driveFrameChunk(chunk);
                         _txDataChunkCount--;
                         _txIdx = 0;
@@ -459,19 +503,18 @@ public:
                         _txDataChunkCount = ARB_CYCLES;
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
                         _txDataReg <<= DATA_WIDTH;
-                        _clkGoFast(); // ARB 끝, 곧바로 DATA로 진입하므로 여기서 가속
+                        _clkGoFast(); // HEADER 끝, 곧바로 DATA로 진입하므로 여기서 가속
                         _driveFrameChunk(chunk);
                         _txDataChunkCount--;
                         _txState = 4; // TX_DATA
                     }
                 } else {
-                    uint16_t arbReg = _txArbReg;
-                    uint8_t myChunk = (arbReg >> ARB_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
-                    arbReg <<= DATA_WIDTH;
-                    _driveDataChunk(myChunk);
-                    _txArbReg = arbReg;
-                    _arbMyChunk = myChunk;
-                    _arbChunksSent++; // [버그1 수정]
+                    // 헤더 남은 청크를 push-pull로 계속 구동
+                    uint16_t headerReg = _txArbReg;
+                    uint8_t chunk = (headerReg >> ARB_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
+                    headerReg <<= DATA_WIDTH;
+                    _driveFrameChunk(chunk); // push-pull 구동 (open-drain이 아님!)
+                    _txArbReg = headerReg;
                     _arbChunkCount = chunkCnt - 1;
                 }
             } else if (_txState == 3) { // TX_LEN
@@ -520,9 +563,9 @@ public:
                     _txDataChunkCount--;
                 }
             }
-            // (구 TX_RELEASE(state 5)는 [버그4 수정]으로 TX_WAIT_ACK(state 7)이 릴리즈까지
-            //  직접 처리하게 되면서 더 이상 쓰이지 않음 - falling-edge 쪽 state7 핸들러 참고)
         } else {
+            // ---- CLK 하강 에지 ----
+
             if (_txState == 7) { // [버그4 수정] TX_WAIT_ACK negedge: ACK(PB0=D8) 확인
                 bool acked = (PINB & (1 << PB0)) == 0; // 마스크 PB0, bit 0: 0000 0001; 수신측이 LOW로 구동했는지
                 if (acked) {
@@ -541,55 +584,9 @@ public:
                 }
                 return;
             }
-            if (_txState == 2) { // TX_ARB negedge: 중재 충돌 검증
-                uint8_t busVal = _readDataChunk();
-                // [내가 보낸 비트] & ~[버스의 실제 비트] => 내가 0(구동)인데 버스가 1이면 충돌(패배)
-                if ((_arbMyChunk & ~busVal) != 0) {
-                    _dataRelease();
-                    DDRD &= ~(1 << PD3); // 마스크 PD3, bit 3: 0000 1000; BUSY 해제 - 내 쪽만
-                    CLR_FLAG(FLAG_IS_SENDING);
-
-                    // [버그1 수정] 중재 패배 = 지금 이 순간 "더 높은 우선순위 노드가 주소 필드를
-                    // 보내는 중"이라는 뜻이고, 그 패킷의 목적지가 나 자신일 수도 있다.
-                    // 그런데 그냥 _rxState=0으로 방치하면 이 패킷의 남은 부분(주소 뒷부분/SRC/LEN/DATA)을
-                    // 통째로 놓쳐버린다. 지금까지 비교를 통과한(=충돌 안 난) 청크들은 전부
-                    // "내가 보낸 값 == 실제 버스 값"이었다는 뜻이므로, 내가 보내려 했던 원본 주소값을
-                    // 그대로 재사용해서 복원할 수 있다. 단, 지금 막 충돌이 감지된 이 청크 하나만은
-                    // 방금 읽은 busVal이 진짜 값이므로 그걸로 교체한다.
-                    uint16_t original =
-                        ((uint16_t)(_txDestId & SWP2P_NODE_MASK) << 7) |
-                        ((uint16_t)_nodeId << 1) |
-                        ((_txDestId & SWP2P_BURST_BIT) ? 1 : 0);
-                    original <<= (16 - FrameTraits::ADDR_BITS);
-                    uint8_t doneBits = _arbChunksSent * DATA_WIDTH;
-                    uint16_t known = original >> (16 - doneBits);
-                    known = (known & ~(uint16_t)DATA_MASK) | busVal;
-
-                    _rxAddrByte = known >> 8;
-                    _rxSrcByte = known;
-                    uint8_t remaining = ADDR_CHUNKS - _arbChunksSent;
-                    if (remaining == 0) _finishRxAddress(known);
-                    else {
-                        if (doneBits >= 6) {
-                            uint8_t destId = known >> (doneBits - 6);
-                            if (destId != _nodeId && destId != SWP2P_BROADCAST && !_isClkMaster) _rxState = 0;
-                            else {
-                                _rxChunkCount = remaining;
-                                _rxState = 1;
-                            }
-                        } else {
-                            _rxChunkCount = remaining;
-                            _rxState = 1; // Continue receiving packed DEST/SRC/BURST header.
-                        }
-                    }
-
-                    _txState = 6; // TX_LOST
-                }
-                return;
-            }
-            // [버그1 수정] TX_LOST(6) 상태에서도 RX 처리는 계속 흘러가야 한다 (원래는 _txState!=0이면
-            // 무조건 return이라 TX_LOST 동안 RX 상태머신이 완전히 멈춰서 승자의 패킷을 못 받았음).
-            if (_txState != 0 && _txState != 6) return;
+            // 송신 중(HEADER/LEN/DATA)이면 하강 에지에서 할 일 없음 (충돌 검증 불필요)
+            // TX_PENDING(1)인 노드는 송신자가 아니므로 다른 노드의 프레임을 수신해야 함
+            if (_txState >= 2) return;
 
             uint8_t rxState = _rxState;
 
@@ -672,8 +669,9 @@ public:
         if (idle) {
             CLR_FLAG(FLAG_IS_BUSY);
             DDRB &= ~(1 << PB0); // 마스크 PB0, bit 0: 0000 0001 (PB0 입력/해제)
-            // 방어적 backstop: ARB/DATA 전환 훅을 어디선가 놓쳤더라도(버그, 예외 경로 등)
-            // 버스가 idle로 돌아오는 시점엔 무조건 저속(ARB 안전속도)으로 맞춰둔다.
+            _frameDataRelease(); // 방어적: 데이터 핀도 확실히 입력(High-Z)으로 해제
+            // 방어적 backstop: HEADER/DATA 전환 훅을 어디선가 놓쳤더라도(버그, 예외 경로 등)
+            // 버스가 idle로 돌아오는 시점엔 무조건 저속(HEADER 안전속도)으로 맞춰둔다.
             _clkGoSlow();
             _rxState = 0;
             _rxAddrByte = 0;
@@ -681,15 +679,22 @@ public:
             _rxLen = 0;
             _rxByteIdx = 0;
 
-            if (_txState == 6) { // TX_LOST -> 재시도
-                _txState = 1;
-                SET_FLAG(FLAG_IS_SENDING);
-            }
+            // 슬롯 카운터 리셋
+#if SWP2P_ROUND_ROBIN
+            _slotBase = (_lastSenderId + 1);
+            if (_slotBase >= SWP2P_MAX_SLOTS) _slotBase = 0;
+            _slotCounter = _slotBase;
+#else
+            _slotCounter = 0;
+#endif
+
+            // TX_PENDING(1) 상태면 그대로 유지 — 다음 idle 슬롯 순회에서 자기 차례를 기다림
         } else {
             SET_FLAG(FLAG_IS_BUSY);
-            if (_txState == 0) {
+            if (_txState <= 1) {
                 _rxState = 1;
                 _rxAddrByte = 0;
+                _rxSrcByte = 0;
                 _rxChunkCount = ADDR_CHUNKS;
             }
         }
