@@ -106,7 +106,7 @@ struct SWP2PFrameTraits {
 
 // ---- 프리셋별 핀 조작 (컴파일타임 특수화, 항상 인라인) ----
 
-// 데이터 핀 방향(DDR)을 통해 chunkVal(하위 DATA_WIDTH비트)을 open-drain으로 구동.
+// Arbitration header를 open-drain으로 구동한다. 프레임 LEN/DATA는 아래 push-pull 함수를 사용한다.
 // 1(하이임피던스) : 입력으로 풀어줌 -> 풀업에 의해 버스가 1로 보임
 // 0(구동)         : 출력으로 전환, PORT는 항상 0으로 유지되어 있으므로 0을 구동
 template <DataPreset PRESET>
@@ -115,7 +115,24 @@ static inline void swp2p_driveDataChunk(uint8_t chunkVal) __attribute__((always_
 template <DataPreset PRESET>
 static inline void swp2p_driveDataChunk(uint8_t chunkVal) {
     // [DDR_reg] &= [BitMask_Clear] | [DataMask_Set] => 지정된 데이터 핀 방향 제어 (1:출력=0구동, 0:입력=하이임피던스)
-    if constexpr (PRESET == PRESET_W1_D4) { DDRD = (DDRD & ~(1 << PD4)) | ((~chunkVal & 0x01) << 4); } // PD4, bit 4: 0001 0000
+    if constexpr (PRESET == PRESET_W4_D4_D7) {
+        // W4 핀은 DDRD 상위 니블에 연속 배치되어 SWAP으로 바로 위치시킬 수 있다.
+        // 기존 정수 승격식은 AVR-GCC에서 16비트 반복 시프트를 만들었으므로 8비트 경로를 고정한다.
+        uint8_t ddr;
+        asm volatile(
+            "in   %[ddr], %[ddr_io]  \n\t"
+            "andi %[ddr], 0x0F       \n\t"
+            "swap %[chunk]           \n\t"
+            "com  %[chunk]           \n\t"
+            "andi %[chunk], 0xF0     \n\t"
+            "or   %[ddr], %[chunk]   \n\t"
+            "out  %[ddr_io], %[ddr]  \n\t"
+            : [ddr] "=&d" (ddr), [chunk] "+d" (chunkVal)
+            : [ddr_io] "I" (_SFR_IO_ADDR(DDRD))
+            : "cc"
+        );
+    }
+    else if constexpr (PRESET == PRESET_W1_D4) { DDRD = (DDRD & ~(1 << PD4)) | ((~chunkVal & 0x01) << 4); } // PD4, bit 4: 0001 0000
     else if constexpr (PRESET == PRESET_W1_D5) { DDRD = (DDRD & ~(1 << PD5)) | ((~chunkVal & 0x01) << 5); } // PD5, bit 5: 0010 0000
     else if constexpr (PRESET == PRESET_W1_D6) { DDRD = (DDRD & ~(1 << PD6)) | ((~chunkVal & 0x01) << 6); } // PD6, bit 6: 0100 0000
     else if constexpr (PRESET == PRESET_W1_D7) { DDRD = (DDRD & ~(1 << PD7)) | ((~chunkVal & 0x01) << 7); } // PD7, bit 7: 1000 0000
@@ -183,6 +200,74 @@ static inline void swp2p_dataRelease() {
     else if constexpr (PRESET == PRESET_W4_A0_A3) DDRC &= ~0x0F; // PC0-PC3 마스크: 0000 1111
     else if constexpr (PRESET == PRESET_W4_D9_D12) DDRB &= ~0x1E; // PB1-PB4 마스크: 0001 1110
     else if constexpr (PRESET == PRESET_W8_A0_D7) { DDRC &= ~0x0F; DDRD &= ~0xF0; } // PC0-PC3: 0000 1111; PD4-PD7: 1111 0000
+}
+
+// Arbitration header remains open-drain. After one sender wins, LEN and DATA
+// use push-pull levels for the rest of that frame.
+template <DataPreset PRESET>
+static inline void swp2p_driveFrameChunk(uint8_t chunkVal) __attribute__((always_inline));
+
+template <DataPreset PRESET>
+static inline void swp2p_driveFrameChunk(uint8_t chunkVal) {
+    if constexpr (PRESET == PRESET_W1_D4) {
+        PORTD = (PORTD & ~0x10) | ((chunkVal & 0x01) << 4); DDRD |= 0x10;
+    } else if constexpr (PRESET == PRESET_W1_D5) {
+        PORTD = (PORTD & ~0x20) | ((chunkVal & 0x01) << 5); DDRD |= 0x20;
+    } else if constexpr (PRESET == PRESET_W1_D6) {
+        PORTD = (PORTD & ~0x40) | ((chunkVal & 0x01) << 6); DDRD |= 0x40;
+    } else if constexpr (PRESET == PRESET_W1_D7) {
+        PORTD = (PORTD & ~0x80) | ((chunkVal & 0x01) << 7); DDRD |= 0x80;
+    } else if constexpr (PRESET == PRESET_W1_D9) {
+        PORTB = (PORTB & ~0x02) | ((chunkVal & 0x01) << 1); DDRB |= 0x02;
+    } else if constexpr (PRESET == PRESET_W1_D10) {
+        PORTB = (PORTB & ~0x04) | ((chunkVal & 0x01) << 2); DDRB |= 0x04;
+    } else if constexpr (PRESET == PRESET_W1_A0) {
+        PORTC = (PORTC & ~0x01) | (chunkVal & 0x01); DDRC |= 0x01;
+    } else if constexpr (PRESET == PRESET_W2_D4_D5) {
+        PORTD = (PORTD & ~0x30) | ((chunkVal & 0x03) << 4); DDRD |= 0x30;
+    } else if constexpr (PRESET == PRESET_W2_D6_D7) {
+        PORTD = (PORTD & ~0xC0) | ((chunkVal & 0x03) << 6); DDRD |= 0xC0;
+    } else if constexpr (PRESET == PRESET_W2_D9_D10) {
+        PORTB = (PORTB & ~0x06) | ((chunkVal & 0x03) << 1); DDRB |= 0x06;
+    } else if constexpr (PRESET == PRESET_W2_A0_A1) {
+        PORTC = (PORTC & ~0x03) | (chunkVal & 0x03); DDRC |= 0x03;
+    } else if constexpr (PRESET == PRESET_W4_D4_D7) {
+        PORTD = (PORTD & ~0xF0) | ((chunkVal & 0x0F) << 4); DDRD |= 0xF0;
+    } else if constexpr (PRESET == PRESET_W4_A0_A3) {
+        PORTC = (PORTC & ~0x0F) | (chunkVal & 0x0F); DDRC |= 0x0F;
+    } else if constexpr (PRESET == PRESET_W4_D9_D12) {
+        PORTB = (PORTB & ~0x1E) | ((chunkVal & 0x0F) << 1); DDRB |= 0x1E;
+    } else if constexpr (PRESET == PRESET_W8_A0_D7) {
+        PORTC = (PORTC & ~0x0F) | (chunkVal & 0x0F);
+        PORTD = (PORTD & ~0xF0) | (chunkVal & 0xF0);
+        DDRC |= 0x0F;
+        DDRD |= 0xF0;
+    }
+}
+
+template <DataPreset PRESET>
+static inline void swp2p_frameDataRelease() __attribute__((always_inline));
+
+template <DataPreset PRESET>
+static inline void swp2p_frameDataRelease() {
+    if constexpr (PRESET == PRESET_W1_D4) { DDRD &= ~0x10; PORTD &= ~0x10; }
+    else if constexpr (PRESET == PRESET_W1_D5) { DDRD &= ~0x20; PORTD &= ~0x20; }
+    else if constexpr (PRESET == PRESET_W1_D6) { DDRD &= ~0x40; PORTD &= ~0x40; }
+    else if constexpr (PRESET == PRESET_W1_D7) { DDRD &= ~0x80; PORTD &= ~0x80; }
+    else if constexpr (PRESET == PRESET_W1_D9) { DDRB &= ~0x02; PORTB &= ~0x02; }
+    else if constexpr (PRESET == PRESET_W1_D10) { DDRB &= ~0x04; PORTB &= ~0x04; }
+    else if constexpr (PRESET == PRESET_W1_A0) { DDRC &= ~0x01; PORTC &= ~0x01; }
+    else if constexpr (PRESET == PRESET_W2_D4_D5) { DDRD &= ~0x30; PORTD &= ~0x30; }
+    else if constexpr (PRESET == PRESET_W2_D6_D7) { DDRD &= ~0xC0; PORTD &= ~0xC0; }
+    else if constexpr (PRESET == PRESET_W2_D9_D10) { DDRB &= ~0x06; PORTB &= ~0x06; }
+    else if constexpr (PRESET == PRESET_W2_A0_A1) { DDRC &= ~0x03; PORTC &= ~0x03; }
+    else if constexpr (PRESET == PRESET_W4_D4_D7) { DDRD &= ~0xF0; PORTD &= ~0xF0; }
+    else if constexpr (PRESET == PRESET_W4_A0_A3) { DDRC &= ~0x0F; PORTC &= ~0x0F; }
+    else if constexpr (PRESET == PRESET_W4_D9_D12) { DDRB &= ~0x1E; PORTB &= ~0x1E; }
+    else if constexpr (PRESET == PRESET_W8_A0_D7) {
+        DDRC &= ~0x0F; PORTC &= ~0x0F;
+        DDRD &= ~0xF0; PORTD &= ~0xF0;
+    }
 }
 
 #endif

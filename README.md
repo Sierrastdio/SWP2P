@@ -25,7 +25,7 @@ SWP2P lets nodes talk to each other directly, without any node acting as a bus m
 | ACK | D8 / PB0 (Timer1 Input Capture, ICP1) | Actively driven low by the addressed receiver to confirm reception |
 | Data line(s) | D4–D7 / D9,D10 / A0–A3, etc., depending on preset | Selected via `DataPreset` |
 
-Data lines are always driven open-drain (pull-up resistors required). For each `DataPreset`, `_driveDataChunk` / `_readDataChunk` / `_dataRelease` are specialized at compile time (`if constexpr`) and fully inlined.
+This experimental branch keeps the arbitration header open-drain, then drives LEN and payload DATA push-pull after one sender wins. BUSY and ACK remain open-drain. External pull-ups are still required for the open-drain phases and control lines. All senders arbitrate before any push-pull frame chunk is driven.
 
 ## Installation
 
@@ -205,7 +205,7 @@ SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 �
 | ACK | D8 / PB0 (Timer1 Input Capture, ICP1) | 목적지 노드가 실제로 LOW 구동하여 수신을 확인 |
 | 데이터선 | Preset에 따라 D4~D7 / D9,D10 / A0~A3 등 | `DataPreset`으로 선택 |
 
-데이터선은 항상 open-drain(풀업 필요)으로 구동되며, 각 `DataPreset`에 맞춰 컴파일타임에 `_driveDataChunk` / `_readDataChunk` / `_dataRelease`가 특수화(`if constexpr`)되어 인라인 전개됩니다.
+이 실험 브랜치에서는 중재 헤더만 open-drain으로 유지하고, 승자가 정해진 뒤 LEN과 페이로드 DATA는 push-pull로 구동합니다. BUSY와 ACK는 계속 open-drain입니다. open-drain 구간과 제어선에는 외부 풀업이 여전히 필요합니다. 푸시풀 프레임 청크를 내보내기 전에 헤더 중재를 먼저 완료합니다.
 
 ## 설치
 

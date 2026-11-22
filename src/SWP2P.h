@@ -170,7 +170,7 @@ public:
         PORTB &= ~(1 << PB0); // 마스크 PB0, bit 0: 0000 0001; PB0 출력 0
         DDRB &= ~(1 << PB0);   // 마스크 PB0, bit 0: 0000 0001; PB0 입력 설정
 
-        _dataRelease();
+        _frameDataRelease();
 
         if (clkIsOutput) {
             DDRB |= (1 << PB1); // 마스크 PB1, bit 1: 0000 0010; PB1 출력 설정
@@ -359,6 +359,14 @@ public:
         swp2p_dataRelease<PRESET>();
     }
 
+    static inline void _driveFrameChunk(uint8_t chunkVal) __attribute__((always_inline)) {
+        swp2p_driveFrameChunk<PRESET>(chunkVal);
+    }
+
+    static inline void _frameDataRelease() __attribute__((always_inline)) {
+        swp2p_frameDataRelease<PRESET>();
+    }
+
     // 프리셋별 폭(WIDTH) 파생 상수도 SWP2PPreset.h의 SWP2PPresetTraits<PRESET>에서 그대로 가져다 쓴다.
     using Traits = SWP2PPresetTraits<PRESET>;
     static constexpr uint8_t DATA_WIDTH = Traits::DATA_WIDTH;
@@ -442,7 +450,7 @@ public:
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK;
                         _txDataReg <<= DATA_WIDTH;
                         _clkGoFast(); // ARB 끝, LEN부터는 페이로드 구간으로 취급해 가속
-                        _driveDataChunk(chunk);
+                        _driveFrameChunk(chunk);
                         _txDataChunkCount--;
                         _txIdx = 0;
                         _txState = 3; // TX_LEN
@@ -452,7 +460,7 @@ public:
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
                         _txDataReg <<= DATA_WIDTH;
                         _clkGoFast(); // ARB 끝, 곧바로 DATA로 진입하므로 여기서 가속
-                        _driveDataChunk(chunk);
+                        _driveFrameChunk(chunk);
                         _txDataChunkCount--;
                         _txState = 4; // TX_DATA
                     }
@@ -472,14 +480,14 @@ public:
                     _txDataChunkCount = ARB_CYCLES;
                     uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
                     _txDataReg <<= DATA_WIDTH;
-                    _driveDataChunk(chunk);
+                    _driveFrameChunk(chunk);
                     _txDataChunkCount--;
                     _txState = 4; // TX_DATA
                 } else {
                     uint8_t dataReg = _txDataReg;
                     uint8_t chunk = (dataReg >> TX_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
                     dataReg <<= DATA_WIDTH;
-                    _driveDataChunk(chunk);
+                    _driveFrameChunk(chunk);
                     _txDataReg = dataReg;
                     _txDataChunkCount--;
                 }
@@ -491,14 +499,14 @@ public:
                         _txDataChunkCount = ARB_CYCLES;
                         uint8_t chunk = (_txDataReg >> TX_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
                         _txDataReg <<= DATA_WIDTH;
-                        _driveDataChunk(chunk);
+                        _driveFrameChunk(chunk);
                         _txDataChunkCount--;
                     } else {
                         // [버그4 수정] 원래는 DATA 다 보내자마자 바로 BUSY를 풀고 "성공"으로 간주했음
                         // (상대가 실제로 받았는지 전혀 확인 안 함). 데이터 라인은 지금 놓아주되,
                         // BUSY(D3)는 계속 잡고 ACK 대기 상태(7)로 넘어가서 PB0(ACK)이 LOW로
                         // 내려오는지 확인한다.
-                        _dataRelease();
+                        _frameDataRelease();
                         _clkGoSlow(); // DATA 끝 -> ACK 대기부터는 다시 저속으로 복귀
                         _ackWaitCount = ACK_WAIT_EDGES;
                         _txState = 7; // TX_WAIT_ACK
@@ -507,7 +515,7 @@ public:
                     uint8_t dataReg = _txDataReg;
                     uint8_t chunk = (dataReg >> TX_SHIFT) & DATA_MASK; // 2^N-1 마스킹 추출
                     dataReg <<= DATA_WIDTH;
-                    _driveDataChunk(chunk);
+                    _driveFrameChunk(chunk);
                     _txDataReg = dataReg;
                     _txDataChunkCount--;
                 }
