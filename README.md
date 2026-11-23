@@ -145,9 +145,12 @@ node.buffFree(buf, 2);
 
 | Preset | Data line(s) | Width |
 |---|---|---|
-| `PRESET_W1_D4`–`PRESET_W1_D10`, `PRESET_W1_A0` | 1 | 1 bit |
-| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_D9_D10`, `PRESET_W2_A0_A1` | 2 | 2 bits |
-| `PRESET_W4_D4_D7`, `PRESET_W4_A0_A3`, `PRESET_W4_D9_D12` | 4 | 4 bits |
+| `PRESET_W1_D4`–`PRESET_W1_D7`, `D10`, `A0` | 1 | 1 bit |
+| `PRESET_W1_D9` | 1 (D9) | 1 bit (Slave only, conflicts with CLK master D9) |
+| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_A0_A1` | 2 | 2 bits |
+| `PRESET_W2_D9_D10` | 2 (D9,D10) | 2 bits (Slave only, conflicts with CLK master D9) |
+| `PRESET_W4_D4_D7` (Default), `PRESET_W4_A0_A3` | 4 | 4 bits |
+| `PRESET_W4_D9_D12` | 4 (D9~D12) | 4 bits (Slave only, conflicts with CLK master D9) |
 | `PRESET_W8_A0_D7` | 8 | 8 bits |
 
 A wider data width carries more bits per clock edge, reducing the number of transfer cycles — but in practice, ISR execution time becomes the bottleneck, so the maximum achievable clock frequency can actually be lower with wider widths (measured internally: roughly 40kHz at WIDTH=1 vs. roughly 29kHz at WIDTH=8). Consider this trade-off when choosing a preset for your use case.
@@ -326,9 +329,12 @@ node.buffFree(buf, 2);
 
 | Preset | 데이터선 | 폭 |
 |---|---|---|
-| `PRESET_W1_D4`~`PRESET_W1_D10`, `PRESET_W1_A0` | 1개 | 1비트 |
-| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_D9_D10`, `PRESET_W2_A0_A1` | 2개 | 2비트 |
-| `PRESET_W4_D4_D7`, `PRESET_W4_A0_A3`, `PRESET_W4_D9_D12` | 4개 | 4비트 |
+| `PRESET_W1_D4`~`PRESET_W1_D7`, `D10`, `A0` | 1개 | 1비트 |
+| `PRESET_W1_D9` | 1개 (D9) | 1비트 (슬레이브 전용, CLK 마스터 D9와 충돌) |
+| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_A0_A1` | 2개 | 2비트 |
+| `PRESET_W2_D9_D10` | 2개 (D9,D10) | 2비트 (슬레이브 전용, CLK 마스터 D9와 충돌) |
+| `PRESET_W4_D4_D7` (기본 권장), `PRESET_W4_A0_A3` | 4개 | 4비트 |
+| `PRESET_W4_D9_D12` | 4개 (D9~D12) | 4비트 (슬레이브 전용, CLK 마스터 D9와 충돌) |
 | `PRESET_W8_A0_D7` | 8개 | 8비트 |
 
 폭이 넓을수록 한 번의 클럭 엣지에 더 많은 비트를 실어 보내 전송 사이클 수는 줄지만, 실측상 ISR 처리 시간이 병목이 되어 최대 클럭 주파수는 오히려 낮아지는 경향이 있었습니다(내부 실측 기준: WIDTH=1에서 약 40kHz, WIDTH=8에서 약 29kHz). 용도에 맞게 트레이드오프를 고려해 선택하세요.

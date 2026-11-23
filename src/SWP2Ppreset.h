@@ -29,6 +29,7 @@
 // 싶으면 이 파일만 건드리면 된다 (SWP2P.h 본체는 손댈 필요 없음).
 // ============================================================
 
+// clang-format off
 #ifndef SWP2P_PRESET_H
 #define SWP2P_PRESET_H
 

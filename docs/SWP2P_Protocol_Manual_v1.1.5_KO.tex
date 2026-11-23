@@ -18,11 +18,11 @@
 \definecolor{lightblue}{RGB}{232,242,252}
 \definecolor{lightgray}{RGB}{245,246,248}
 \definecolor{codegreen}{RGB}{35,120,70}
-\hypersetup{colorlinks=true,linkcolor=navy,urlcolor=blue,pdftitle={SWP2P 프로토콜 매뉴얼 v1.1.5 (한국어판)}}
+\hypersetup{colorlinks=true,linkcolor=navy,urlcolor=blue,pdftitle={SWP2P 프로토콜 매뉴얼 v2.1.5 (한국어판)}}
 \pagestyle{fancy}
 \fancyhf{}
 \lhead{\small\textbf{SWP2P} \quad 프로토콜 매뉴얼}
-\rhead{\small 구현 참조서 \quad v1.1.5 한국어판}
+\rhead{\small 구현 참조서 \quad v2.1.5 한국어판}
 \cfoot{\thepage}
 \renewcommand{\headrulewidth}{0.5pt}
 \titleformat{\section}{\large\bfseries\color{navy}}{\thesection}{0.6em}{}[\titlerule]
@@ -42,8 +42,8 @@
   \node[anchor=north west,align=left,text width=15cm] at ([xshift=28mm,yshift=-42mm]current page.north west) {
     {\Large\bfseries\color{blue} 프로토콜 매뉴얼 및 구현 참조서}\\[5mm]
     {\fontsize{32}{38}\selectfont\bfseries\color{navy} SWP2P}\\[3mm]
-    {\Large AVR MCU용 오픈드레인 병렬 피어 투 피어 버스}\\[2mm]
-    {\large 프레임 필드, 에지 사이클, 상태 머신 및 소스 코드 대응}
+    {\Large AVR MCU용 슬롯 중재 및 푸시풀 병렬 피어 투 피어 버스}\\[2mm]
+    {\large 프레임 필드, 에지 사이클, 슬롯 상태 머신 및 소스 코드 대응}
   };
 \end{tikzpicture}
 \vspace*{105mm}
@@ -52,7 +52,7 @@
 \end{tcolorbox}
 \vspace{8mm}
 \begin{tabularx}{\linewidth}{@{}lY@{}}
-\textbf{문서 버전} & v1.1.5 구현 매뉴얼 \\
+\textbf{문서 버전} & v2.1.5 구현 매뉴얼 \\
 \textbf{대상 구현} & Arduino Uno / ATmega328P, AVR 레지스터 및 인터럽트 \\
 \textbf{기본 데이터 폭} & W4, 프리셋 \code{PRESET_W4_D4_D7} \\
 \textbf{기본 버스트 용량} & \code{SWP2P_MAX_BURST = 16} \\
@@ -67,12 +67,12 @@
 \clearpage
 
 \section{목적과 용어}
-SWP2P는 소프트웨어로 구현된 다중 노드 버스입니다. 중앙 패킷 라우팅 마스터 없이 각 노드가 전송을 요청할 수 있습니다. 지정된 한 노드가 공통 클럭을 공급하지만, 클럭 공급 노드가 어느 노드가 전송할지를 결정하지는 않습니다. 노드들은 BUSY가 활성화된 동안 헤더를 전송하며 중재합니다.
+SWP2P는 소프트웨어로 구현된 다중 노드 버스입니다. 중앙 패킷 라우팅 마스터 없이 각 노드가 대등하게 전송을 요청할 수 있습니다. 지정된 한 노드가 공통 클럭을 공급하지만, 클럭 공급 노드가 어느 노드가 전송할지를 결정하지는 않습니다. 노드들은 BUSY 유휴 복귀 후 CLK 상승 에지마다 증가하는 슬롯 카운터를 기반으로 송신 시점을 순서화하여 충돌 없이 버스를 점유하고, 슬롯을 얻은 송신자가 프레임 전체(헤더, LEN, DATA)를 푸시풀(Push-Pull)로 구동합니다.
 
 이 문서는 \emph{와이어 프로토콜}과 \emph{구현 상태 머신}을 구분합니다. 와이어 필드는 DATA 선에서 관측되는 비트를 말합니다. 상태 번호와 변수명은 현재 AVR 소스 코드를 가리킵니다. 별도 표기가 없으면 각 필드와 데이터 바이트는 최상위 비트(MSB)부터 전송합니다.
 
 \begin{tcolorbox}[colback=lightblue,colframe=blue,title=호환성 주의]
-v1.1.5의 압축 헤더는 기존 DEST/SRC 2바이트 헤더와 와이어 호환되지 않습니다. 같은 버스의 모든 노드는 동일한 형식의 구현을 사용해야 합니다. 버전 협상이나 구형 프레임 자동 감지는 지원하지 않습니다.
+v1.1.5의 압축 헤더 및 슬롯 중재/푸시풀 구동 방식은 기존 오픈드레인 비트 중재 헤더와 와이어 호환되지 않습니다. 같은 버스의 모든 노드는 동일한 형식의 구현을 사용해야 합니다. 버전 협상이나 구형 프레임 자동 감지는 지원하지 않습니다.
 \end{tcolorbox}
 
 \section{물리 신호와 에지 규칙}
@@ -81,17 +81,17 @@ v1.1.5의 압축 헤더는 기존 DEST/SRC 2바이트 헤더와 와이어 호환
 \caption{Uno 구현에서 사용하는 신호}
 \begin{tabularx}{\linewidth}{@{}l l l Y@{}}\toprule
 신호 & Uno 핀 & 사용 노드 & 구현상 의미 \\\midrule
-CLK 입력 & D2 / PD2 / INT0 & 모든 노드 & 논리 변화 인터럽트입니다. 핀 레벨을 확인해 상승 에지는 송신/갱신 단계, 하강 에지는 수신/되읽기 단계로 처리합니다. \\
+CLK 입력 & D2 / PD2 / INT0 & 모든 노드 & 논리 변화 인터럽트입니다. 핀 레벨을 확인해 상승 에지는 송신/갱신 단계, 하강 에지는 수신/샘플링 단계로 처리합니다. \\
 CLK 출력 & D9 / PB1 / OC1A & 클럭 공급 노드 & Timer1 CTC 하드웨어가 OC1A를 토글합니다. 다른 노드는 이 신호를 D2에 연결합니다. \\
-BUSY & D3 / PD3 / INT1 & 공유 선 & LOW 활성 신호입니다. 송신자는 LOW로 구동해 활성화하고 입력/하이 임피던스로 전환해 해제합니다. \\
-ACK & D8 / PB0 & 공유 선 & LOW 활성 신호입니다. 수신자는 마지막 데이터 바이트 뒤 ACK를 활성화하고 BUSY가 유휴 상태로 돌아오면 ACK를 해제합니다. \\
-DATA & 프리셋에 따라 다름 & 공유 병렬 선 & 오픈드레인 방식입니다. 노드는 0을 보낼 때 LOW로 구동하고 1을 보낼 때 핀을 해제합니다. \\\bottomrule
+BUSY & D3 / PD3 / INT1 & 공유 선 & 오픈드레인 LOW 활성 신호입니다. 송신자는 자기 슬롯에서 LOW로 구동해 점유하고, 전송 및 ACK 수신 완료 후 입력/하이 임피던스로 전환해 해제합니다. \\
+ACK & D8 / PB0 & 공유 선 & 오픈드레인 LOW 활성 신호입니다. 지정된 수신자는 마지막 데이터 바이트 수신 후 ACK를 활성화하고 BUSY가 유휴 상태로 돌아오면 ACK를 해제합니다. \\
+DATA & 프리셋에 따라 다름 & 공유 병렬 선 & 푸시풀(Push-Pull) 방식입니다. 슬롯을 점유한 송신자만 활성화하여 강하게 HIGH/LOW를 구동하고, 전송 완료 시 입력(High-Z)으로 해제합니다. \\\bottomrule
 \end{tabularx}
 \end{table}
 
-DATA, BUSY, ACK는 방향 레지스터를 바꿔 LOW로 구동하거나 선을 해제하며, 외부 풀업 저항이 HIGH를 만듭니다. 클럭 출력은 DATA 오픈드레인 함수가 아니라 Uno의 Timer1 OC1A 출력에서 생성됩니다. 소스 코드는 D2와 D3의 인터럽트를 설정하지만 버스 풀업은 설정하지 않습니다.
+제어선(BUSY, ACK)은 오픈드레인 방식으로 동작하므로 외부 풀업 저항이 필수적입니다. 반면 DATA 선은 슬롯을 획득한 단일 송신자가 헤더부터 LEN/DATA까지 푸시풀로 구동하므로 신호 슬루율(Slew-rate)이 우수하며 고속 클럭 전송에 유리합니다(유휴 상태 플로팅 방지를 위해 데이터선에도 풀업 저항 구성을 권장합니다). 클럭 출력은 Uno의 Timer1 OC1A(D9) 출력에서 자동 생성됩니다.
 
-각 와이어 청크에서 송신자는 CLK 상승 에지에 DATA를 갱신합니다. 수신자는 대응하는 하강 에지에서 DATA를 샘플링합니다. 송신자도 중재 중에는 하강 에지에서 DATA를 되읽습니다. 따라서 CLK 한 주기마다 프리셋 폭의 청크 하나를 전송하며, 주기의 절반은 갱신, 나머지 절반은 샘플링에 사용됩니다.
+각 와이어 청크에서 송신자는 CLK 상승 에지에 DATA를 푸시풀로 갱신합니다. 수신자는 대응하는 하강 에지에서 DATA를 샘플링합니다. 슬롯 선점으로 인해 전송 중 충돌이 원천 방지되므로 하강 에지에서의 송신자 되읽기 중재 검사는 수행하지 않습니다. 따라서 CLK 한 주기마다 프리셋 폭의 청크 하나를 전송합니다.
 
 \section{프레임 형식}
 \subsection{논리 프레임}
@@ -178,7 +178,7 @@ W4 헤더는 기존 16비트 헤더를 니블 단위로 올림했을 때와 마�
   \node[left] at (2.0,-2.95) {ACK};
   \node[anchor=west,text width=13cm,align=left] at (2.1,-3.5) {지정 수신자는 마지막 DATA 바이트 뒤 ACK를 활성화하며 BUSY 해제 시 ACK도 해제됩니다.};
 \end{tikzpicture}
-\caption{W4 버스트 전송 예시(기본 최대 16바이트). C0~C3은 패딩된 중재 헤더, C4는 LEN이며 데이터 바이트마다 2클럭이 필요합니다. D=DEST, S=SRC, B=BURST, P=후행 패딩 3비트입니다. D0H/D0L은 DATA[0]의 상위/하위 니블입니다. 그림에는 예시 데이터 2바이트만 표시했으며 프레임 길이가 고정된 것은 아닙니다.}
+\caption{W4 버스트 전송 예시(기본 최대 16바이트). C0~C3은 패딩된 푸시풀 헤더, C4는 LEN이며 데이터 바이트마다 2클럭이 필요합니다. D=DEST, S=SRC, B=BURST, P=후행 패딩 3비트입니다. D0H/D0L은 DATA[0]의 상위/하위 니블입니다. 그림에는 예시 데이터 2바이트만 표시했으며 프레임 길이가 고정된 것은 아닙니다.}
 \label{fig:w4burst}
 \end{figure}
 
@@ -188,12 +188,12 @@ W4 헤더는 기존 16비트 헤더를 니블 단위로 올림했을 때와 마�
 \centering\small
 \begin{tabularx}{0.96\linewidth}{@{}c Y Y@{}}\toprule
 사이클 이름 & 물리 동작 & 현재 소스의 상태/변수 동작 \\\midrule
-S & BUSY가 활성화되고 다음 CLK 상승 에지에서 송신자가 첫 헤더 청크 C0를 구동합니다. & TX: \code{_txState=1} (PENDING)가 2 (ARB)로 바뀝니다. \code{_txArbReg}, \code{_arbMyChunk}, \code{_arbChunkCount}를 초기화합니다. RX는 INT1의 \code{_onBusyEdge()}에서 시작합니다. \\
-C0...C(A-1) & 헤더/중재 청크입니다. 상승 에지에서 DATA를 갱신하고 하강 에지에서 되읽으며 수신기가 헤더를 누적합니다. & TX는 \code{_arbMyChunk}와 \code{_readDataChunk()}를 비교합니다. RX는 \code{_rxAddrByte}와 \code{_rxSrcByte}에 헤더를 누적합니다. \code{A=ADDR_CHUNKS}입니다. \\
-L0...L(K-1) & 버스트에서만 LEN 청크를 전송합니다. & TX 상태 3은 \code{_txDataReg}, \code{_txDataChunkCount}를 사용합니다. RX 상태 3은 \code{_rxDataByte}에 누적한 뒤 \code{_rxLen}을 설정합니다. \code{K=LEN_CHUNKS}입니다. \\
-D(i,0)... & 데이터 바이트 i를 \code{8/DATA_WIDTH}개 청크로 나눠 전송합니다. & TX 상태 4는 \code{_txIdx}를 증가시킵니다. RX 상태 4는 \code{_rxDataByte}를 조립한 뒤 \code{_fifoPush()}로 데이터와 송신자 ID를 저장합니다. \\
-ACK & 수신기는 마지막 바이트 뒤 ACK를 LOW로 활성화하고 송신자는 정해진 수의 CLK 에지 동안 응답을 기다립니다. & RX 상태 5가 PB0/D8을 구동합니다. TX 상태 7은 ACK를 확인하고 \code{FLAG_ACK_FAILED}를 지우거나 타임아웃으로 설정합니다. \\
-IDLE & 송신자가 BUSY를 해제해 선이 HIGH로 돌아갑니다. & INT1 유휴 경로가 busy 플래그를 지우고 ACK 및 RX 파서를 초기화하며 TX는 송신 상태를 해제합니다. \\\bottomrule
+S & 유휴 상태에서 슬롯 카운터가 노드 ID와 일치하면 BUSY를 LOW로 점유하고 첫 헤더 청크 C0를 푸시풀로 구동합니다. & TX: \code{_txState=1} (PENDING)가 2 (HEADER)로 바뀝니다. \code{_txArbReg}, \code{_arbChunkCount}를 초기화하고 첫 청크를 푸시풀 출력합니다. 수신기는 INT1의 \code{_onBusyEdge()}에서 시작합니다. \\
+C0...C(A-1) & 헤더 청크 푸시풀 전송 단계입니다. 상승 에지에서 DATA를 푸시풀로 갱신하고 수신기는 하강 에지에서 샘플링합니다. & TX는 충돌 되읽기 없이 남은 헤더를 푸시풀 구동합니다. RX는 \code{_rxAddrByte}와 \code{_rxSrcByte}에 헤더를 누적합니다. \code{A=ADDR_CHUNKS}입니다. \\
+L0...L(K-1) & 버스트에서만 LEN 청크를 푸시풀로 전송합니다. & TX 상태 3은 \code{_txDataReg}, \code{_txDataChunkCount}를 사용합니다. RX 상태 3은 \code{_rxDataByte}에 누적한 뒤 \code{_rxLen}을 설정합니다. \code{K=LEN_CHUNKS}입니다. \\
+D(i,0)... & 데이터 바이트 i를 \code{8/DATA_WIDTH}개 청크로 나눠 푸시풀로 전송합니다. & TX 상태 4는 \code{_txIdx}를 증가시킵니다. RX 상태 4는 \code{_rxDataByte}를 조립한 뒤 \code{_fifoPush()}로 데이터와 송신자 ID를 저장합니다. \\
+ACK & 수신기는 마지막 바이트 뒤 ACK를 오픈드레인 LOW로 활성화하고 송신자는 정해진 수의 CLK 에지 동안 응답을 기다립니다. & 송신자는 데이터선을 해제(\code{_frameDataRelease()})하고 대기합니다. RX 상태 5가 PB0/D8을 LOW 구동합니다. TX 상태 7은 ACK를 확인하고 \code{FLAG_ACK_FAILED}를 처리합니다. \\
+IDLE & 송신자가 BUSY를 해제해 선이 HIGH로 돌아갑니다. & INT1 유휴 경로가 busy 플래그를 지우고 슬롯 카운터를 초기화(\code{_slotCounter=0})하며, ACK 및 RX 파서를 초기화합니다. \\\bottomrule
 \end{tabularx}
 \end{figure}
 
@@ -203,14 +203,16 @@ IDLE & 송신자가 BUSY를 해제해 선이 HIGH로 돌아갑니다. & INT1 유
 \subsection{버스트 경로}
 버스트에서는 BURST=1이며 수신기는 먼저 설정된 수의 LEN 청크를 읽습니다. \code{_rxLen = LEN + 2}를 디코딩한 뒤 해당 바이트 수만큼 수신하고 ACK 단계로 이동합니다. 바이트마다 ACK를 보내지는 않습니다. 완성된 바이트는 도착 즉시 FIFO에 저장되므로 애플리케이션의 \code{readBytes()} 호출은 프레임 수신이 끝나기 전에 일부 FIFO 데이터만 읽을 수도 있습니다.
 
-\section{중재와 노드 필터링}
-여러 송신자가 경쟁하면 각 노드는 헤더 청크를 보내고 공유 DATA 버스를 되읽습니다. DATA 선을 해제(1 전송)했는데 실제 버스가 LOW인 것을 감지한 송신자는 DATA와 BUSY를 해제하고 TX_LOST에 진입한 뒤 BUSY가 유휴 상태로 돌아오면 재시도합니다. 패배 노드가 승자 패킷의 목적지일 수도 있으므로 필요한 경우 수신 파서는 승자의 헤더 처리를 계속합니다.
+\section{슬롯 기반 중재와 노드 필터링}
+SWP2P는 데이터선의 충돌을 원천 차단하기 위해 **고정 ID별 CLK 슬롯(Fixed-ID CLK Slot)** 방식을 채택합니다. BUSY 선이 유휴(HIGH)로 복귀하면 모든 노드의 슬롯 카운터(\code{_slotCounter})가 0으로 초기화됩니다. 이후 버스가 유휴인 동안 매 CLK 상승 에지마다 슬롯 카운터가 1씩 증가합니다(0부터 \code{SWP2P_MAX_SLOTS - 1}까지 순환).
 
-클럭 비공급 노드는 DEST가 일치하지 않는다는 사실을 판별할 만큼 헤더를 읽은 뒤 RX 파서를 멈춥니다. 전기적으로 버스 연결을 끊는 것은 아닙니다. DATA 버스가 오픈드레인이므로 선을 해제한 노드는 다른 노드의 전송을 방해하지 않습니다. 클럭 공급 노드는 목적지가 아닌 프레임의 LEN 및 데이터 청크 수를 계속 추적해 중재용 클럭 속도로 복귀할 시점을 파악합니다.
+송신 대기 중인 노드(\code{_txState == 1})는 자신의 슬롯(\code{_slotCounter == _nodeId})이 되었을 때 BUSY 핀을 검사합니다. BUSY가 여전히 HIGH(유휴)라면 해당 노드가 BUSY를 즉시 LOW로 구동해 버스를 점유하고 헤더 전송(\code{_txState = 2})을 시작합니다. 다른 노드는 BUSY가 LOW로 떨어진 것을 보고 수신 상태(\code{_rxState = 1})로 전환하며, 버스가 점유되어 있는 동안에는 슬롯 카운터가 증가하지 않으므로 다른 송신 노드의 전송 시작이 억제됩니다.
 
-\begin{tcolorbox}[colback=lightgray,colframe=navy,title=구현상 제한]
-코드는 멀티비트 프리셋 청크를 비트 마스크 불일치 검사로 비교합니다. W1에서는 이 방식이 단순합니다. W2/W4/W8에서 동시에 충돌하면 각 선의 중재 결과가 섞여 단일 송신자만 승리하도록 보장하기 위해 청크 전체의 사전식 비교가 필요한 경우가 생길 수 있습니다. 이 매뉴얼은 현재 구현을 기록한 것이며, 해당 동작을 수정하거나 하드웨어에서 검증하기 전까지 모든 다중 노드 동시 중재가 검증되었다고 간주하면 안 됩니다.
+\begin{tcolorbox}[colback=lightgray,colframe=navy,title=라운드로빈 공정성 옵션]
+기본 고정 ID 슬롯 방식에서는 낮은 ID를 가진 노드가 항상 먼저 슬롯을 획득하므로, 트래픽이 집중될 경우 높은 ID 노드가 지연될 수 있습니다. 이를 방지하기 위해 \code{#define SWP2P_ROUND_ROBIN 1} 매크로를 정의하면, 직전 프레임을 송신한 노드의 다음 ID(\code{(lastSender + 1) \% MAX_SLOTS})부터 슬롯 카운터를 시작하는 라운드로빈 공정성 메커니즘을 적용할 수 있습니다.
 \end{tcolorbox}
+
+클럭 비공급 노드는 DEST가 일치하지 않는다는 사실을 판별할 만큼 헤더를 읽은 뒤 목적지가 아니면 RX 파서를 멈춥니다(\code{_rxState = 0}). 클럭 공급 노드는 목적지가 아닌 프레임이더라도 LEN 및 데이터 청크 수를 계속 추적해 프레임 종료 시점에 안전한 저속 클럭으로 복귀합니다.
 
 \section{클럭 생성과 동적 속도}
 \code{begin(true, clkFreq, dataFreq)}로 시작한 노드는 Timer1 CTC와 OC1A(D9)로 CLK를 생성합니다. 나머지 노드는 \code{begin(false)}를 사용해 D2의 외부 클럭을 따릅니다. 기본 클럭을 생략하면 기준 속도는 100 kHz이며, 프로젝트 예제는 중재 45 kHz와 페이로드 50 kHz를 사용합니다.
@@ -227,12 +229,11 @@ IDLE & 송신자가 BUSY를 해제해 선이 HIGH로 돌아갑니다. & INT1 유
 \begin{tabularx}{\linewidth}{@{}c l Y c l Y@{}}\toprule
 TX & 이름 & 의미 & RX & 이름 & 의미 \\\midrule
 0 & IDLE & 대기 중인 송신 없음 & 0 & IDLE/FILTERED & 파서 동작 없음, 목적지 불일치 필터링 포함 \\
-1 & PENDING & 시작/클럭 에지 대기 & 1 & HEADER & 압축 DEST/SRC/BURST 헤더 수집 \\
-2 & ARB & 헤더 청크 송신/비교 & 3 & LEN & 버스트 길이 수신 \\
-3 & LEN & 버스트 길이 송신 & 4 & DATA & 자기 목적지 DATA 수신 \\
-4 & DATA & 페이로드 바이트 송신 & 5 & ACK & 수신 완료 후 ACK 활성화 \\
-6 & LOST & 중재 패배, 유휴 시 재시도 & 6 & DISCARD & 클럭 공급 노드가 목적지 외 DATA를 프레임 끝까지 계산 \\
-7 & WAIT\_ACK & ACK 또는 타임아웃 대기 & & & \\\bottomrule
+1 & PENDING & 슬롯 및 클럭 에지 대기 & 1 & HEADER & 압축 DEST/SRC/BURST 헤더 수집 \\
+2 & HEADER & 헤더 청크 푸시풀 송신 & 3 & LEN & 버스트 길이 수신 \\
+3 & LEN & 버스트 길이 푸시풀 송신 & 4 & DATA & 자기 목적지 DATA 수신 \\
+4 & DATA & 페이로드 바이트 푸시풀 송신 & 5 & ACK & 수신 완료 후 ACK 활성화 \\
+7 & WAIT\_ACK & ACK 또는 타임아웃 대기 & 6 & DISCARD & 클럭 공급 노드가 목적지 외 DATA를 프레임 끝까지 계산 \\\bottomrule
 \end{tabularx}
 \end{table}
 
@@ -245,9 +246,10 @@ TX & 이름 & 의미 & RX & 이름 & 의미 \\\midrule
 \code{_txDestId} & 정적 바이트 & 하위 6비트는 DEST입니다. 7번 비트는 \code{sendBurst()}가 내부적으로 사용하는 표식이며 와이어 헤더 바이트로 전송되지 않습니다. \\
 \code{_txLen}, \code{_txIdx} & 정적 바이트 & 요청된 페이로드 길이와 현재 TX 바이트 인덱스입니다. \\
 \code{_txBuffer[]}, \code{_txData} & 정적 바이트 배열 & 복사된 버스트 페이로드 및 단일 바이트 페이로드입니다. \code{sendBurst()}는 반환 전에 데이터를 복사합니다. \\
-\code{_txArbReg} & 16비트 & 왼쪽 정렬된 13비트 헤더와 프리셋 후행 패딩입니다. MSB부터 시프트해 전송합니다. \\
+\code{_txArbReg} & 16비트 & 왼쪽 정렬된 13비트 헤더와 프리셋 후행 패딩입니다. 푸시풀 출력 시 MSB부터 시프트합니다. \\
 \code{_arbChunkCount} & 바이트 & 첫 헤더 청크를 구동한 뒤 남은 헤더 청크 수입니다. \\
-\code{_arbMyChunk}, \code{_arbChunksSent} & 바이트 & 되읽기 중재에 사용하는 로컬 청크와 지금까지 구동한 청크 수입니다. \\
+\code{_slotCounter} & 바이트 & 버스 유휴 중 CLK 상승 에지마다 증가하는 슬롯 카운터입니다(유휴 복귀 시 초기화). \\
+\code{_slotBase}, \code{_lastSenderId} & 바이트 & \code{SWP2P_ROUND_ROBIN} 활성화 시 슬롯 시작 오프셋 및 직전 송신자 ID입니다. \\
 \code{_txDataReg}, \code{_txDataChunkCount} & 바이트 & LEN/DATA 시프트 레지스터와 남은 청크 수입니다. \\
 \code{_rxAddrByte}, \code{_rxSrcByte} & 바이트 & 두 변수는 16비트 압축 헤더 수신 누산기를 구성합니다. 디코딩 후 \code{_rxSrcByte}는 송신자 ID 저장에 재사용됩니다. \\
 \code{_rxDataByte} & 바이트 & LEN 누산기 또는 현재 DATA 바이트 누산기입니다. \\
@@ -296,13 +298,13 @@ API & 동작 \\\midrule
 \item 프레임에는 CRC/체크섬이 없습니다. ACK는 수신기가 수신 경로의 끝까지 도달했음을 확인할 뿐 모든 데이터 비트가 정확했음을 보증하지는 않습니다.
 \item RX FIFO는 바이트 단위의 유한 큐입니다(기본 16개). FIFO가 가득 차면 \code{_fifoPush()}가 바이트를 조용히 버리므로 애플리케이션에서 제때 읽어야 합니다.
 \item 그림은 논리적인 에지 순서를 나타냅니다. 실제 상승/하강 시간, 최대 안정 주파수, 동시 중재 동작은 실제 보드, 배선, 풀업, 빌드로 검증해야 합니다.
-\item Uno에서 D9는 Timer1 OC1A, D8은 PB0/ACK입니다. 클럭 공급 노드에서는 D9를 DATA로 지정하는 프리셋을 함께 쓸 수 없습니다. D2와 D3은 CLK/BUSY 전용 핀입니다. 예제의 D10 입력은 W4의 D4~D7과 별개입니다.
+\item Uno에서 D9는 Timer1 OC1A, D8은 PB0/ACK입니다. D9(PB1)를 DATA로 사용하는 프리셋(\code{PRESET_W1_D9}, \code{PRESET_W2_D9_D10}, \code{PRESET_W4_D9_D12})은 클럭 공급 노드(\code{begin(true)})에서 하드웨어 핀 충돌을 막기 위해 안전 가드로 차단되므로, 슬레이브 노드(\code{begin(false)})에서만 사용할 수 있습니다. D2와 D3은 CLK/BUSY 전용 핀입니다.
 \end{itemize}
 
 \section{소스 파일}
 \begin{itemize}
-\item \code{src/SWP2P.h}: 공개 API, TX/RX 상태 머신, ISR 핸들러, 타이머 속도 전환.
-\item \code{src/SWP2Ppreset.h}: 프리셋 핀 매핑, 오픈드레인 DATA 동작, 프레임 폭 특성.
+\item \code{src/SWP2P.h}: 공개 API, 슬롯 기반 TX/RX 상태 머신, ISR 핸들러, 타이머 속도 전환.
+\item \code{src/SWP2Ppreset.h}: 프리셋 핀 매핑, 푸시풀 DATA 구동 및 해제, 프레임 폭 특성.
 \item \code{src/SWP2P.cpp}: 정적 저장 공간, FIFO 구현, Timer1 설정.
 \item \code{src/SWP2Pbuffer.h}: 애플리케이션 측 고정 용량 버퍼 유틸리티.
 \end{itemize}
