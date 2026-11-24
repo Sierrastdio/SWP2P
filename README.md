@@ -9,7 +9,8 @@ SWP2P lets nodes talk to each other directly, without any node acting as a bus m
 - **Masterless architecture**: One node may drive the CLK line, but that node does not act as a bus master. All nodes participate in send/receive as equals.
 - **Configurable data width**: Choose 1/2/4/8 data lines (`DataPreset`). More lines means more bits per clock edge and higher throughput.
 - **CLK/BUSY/ACK based protocol**: Only a minimal set of control lines (BUSY, ACK) is needed, supporting roughly 10 nodes on the bus by design.
-- **Bit-level arbitration**: The 2-byte destination + source address is driven open-drain and read back on the falling edge for comparison; on a collision the losing node yields automatically (`TX_LOST` → auto-retry once the bus goes idle). The losing node also reconstructs the address bits it already sent so it doesn't miss the winner's packet if that packet happens to be addressed to it.
+- **Fixed-ID CLK slot arbitration**: Instead of bit-level open-drain arbitration, transmission turns are ordered by fixed-ID CLK slots after the bus returns to idle. When BUSY is idle, the slot counter resets, and each node inspects BUSY on its slot. Only if BUSY is still HIGH does that node assert BUSY LOW and begin transmission. (Round-Robin fairness can be optionally enabled).
+- **Full push-pull data frame**: Because only the node that wins the slot transmits, the entire frame—from header through LEN and DATA—is driven push-pull. This significantly sharpens edge transitions and allows higher CLK rates compared to open-drain.
 - **Single-byte and burst transfers**: `send()` uses the original fast path (no LEN field); `sendBurst()` adds a LEN field to transfer multiple bytes in one frame.
 - **Real ACK with timeout**: The sender doesn't declare success just because it finished driving data — it waits for the addressed receiver to actively drive the ACK line low, with a bounded timeout (`isAckFailed()` reports failed transfers).
 - **Sender ID delivered with every received byte**: The RX FIFO stores a source-ID alongside each data byte, so a node reading from multiple peers can tell them apart.
@@ -25,7 +26,7 @@ SWP2P lets nodes talk to each other directly, without any node acting as a bus m
 | ACK | D8 / PB0 (Timer1 Input Capture, ICP1) | Actively driven low by the addressed receiver to confirm reception |
 | Data line(s) | D4–D7 / D9,D10 / A0–A3, etc., depending on preset | Selected via `DataPreset` |
 
-Data lines are always driven open-drain (pull-up resistors required). For each `DataPreset`, `_driveDataChunk` / `_readDataChunk` / `_dataRelease` are specialized at compile time (`if constexpr`) and fully inlined.
+This branch drives the entire data frame (HEADER, LEN, and payload DATA) push-pull after a sender claims its CLK slot. BUSY and ACK remain open-drain. External pull-ups are required for the control lines (BUSY, ACK) and recommended for data lines to keep lines stable when idle.
 
 ## Installation
 
@@ -144,25 +145,28 @@ node.buffFree(buf, 2);
 
 | Preset | Data line(s) | Width |
 |---|---|---|
-| `PRESET_W1_D4`–`PRESET_W1_D10`, `PRESET_W1_A0` | 1 | 1 bit |
-| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_D9_D10`, `PRESET_W2_A0_A1` | 2 | 2 bits |
-| `PRESET_W4_D4_D7`, `PRESET_W4_A0_A3`, `PRESET_W4_D9_D12` | 4 | 4 bits |
+| `PRESET_W1_D4`–`PRESET_W1_D7`, `D10`, `A0` | 1 | 1 bit |
+| `PRESET_W1_D9` | 1 (D9) | 1 bit (Slave only, conflicts with CLK master D9) |
+| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_A0_A1` | 2 | 2 bits |
+| `PRESET_W2_D9_D10` | 2 (D9,D10) | 2 bits (Slave only, conflicts with CLK master D9) |
+| `PRESET_W4_D4_D7` (Default), `PRESET_W4_A0_A3` | 4 | 4 bits |
+| `PRESET_W4_D9_D12` | 4 (D9~D12) | 4 bits (Slave only, conflicts with CLK master D9) |
 | `PRESET_W8_A0_D7` | 8 | 8 bits |
 
 A wider data width carries more bits per clock edge, reducing the number of transfer cycles — but in practice, ISR execution time becomes the bottleneck, so the maximum achievable clock frequency can actually be lower with wider widths (measured internally: roughly 40kHz at WIDTH=1 vs. roughly 29kHz at WIDTH=8). Consider this trade-off when choosing a preset for your use case.
 
 ## Protocol Overview
 
-1. **ARB (Arbitration)**: The packed header is `DEST(6) + SRC(6) + BURST(1)`, MSB first. It is driven open-drain and read back on each falling edge for arbitration. The wire header is padded to whole preset-width chunks. A losing sender reconstructs the winner's already-transmitted header prefix and continues receiving; it retries after BUSY returns idle.
-2. **LEN (burst frames only)**: The value `len - 2` is encoded using the minimum bit width required by `SWP2P_MAX_BURST`, padded to whole preset-width chunks. This step is skipped for single-byte transfers.
-3. **DATA**: 1 byte (single transfer) or `len` bytes (burst) are transmitted in sequence.
+1. **HEADER (Slot-based allocation)**: When BUSY returns idle, the slot counter resets to 0. On each CLK rising edge, if `_slotCounter == _nodeId` and BUSY is HIGH, the node asserts BUSY LOW and starts driving the packed header `DEST(6) + SRC(6) + BURST(1)` push-pull. Other nodes observe BUSY going LOW and enter RX state without collision.
+2. **LEN (burst frames only)**: The value `len - 2` is encoded using the minimum bit width required by `SWP2P_MAX_BURST`, padded to whole preset-width chunks, driven push-pull. This step is skipped for single-byte transfers.
+3. **DATA**: 1 byte (single transfer) or `len` bytes (burst) are transmitted in sequence push-pull.
 4. **ACK**: The sender releases the data line(s) but keeps BUSY asserted while it waits a bounded number of clock edges for the addressed receiver to drive ACK low. If the ACK arrives in time, the send is marked successful; otherwise it times out and `isAckFailed()` will report `true` on the next check. Either way, BUSY is released once the wait ends so other nodes can use the bus.
 
 Receiving nodes only capture packets addressed to them (or broadcast packets) into the FIFO, and only the addressed receiver drives ACK; other packets/nodes are tracked for line-state purposes only and otherwise ignored.
 
 ## Design Constraints / Notes
 
-- Data lines must be open-drain with pull-up resistors — testing confirmed that communication is impossible without pull-ups.
+- Control lines (BUSY, ACK) require external pull-up resistors as they operate open-drain. Data lines are driven push-pull during transmission, but pull-ups are recommended for floating state during bus idle.
 - Node IDs are limited to 0–62; 63 (`SWP2P_BROADCAST`) is reserved for broadcast. The 13-bit packed header takes 13 clocks at W1, 7 at W2, 4 at W4, and 2 at W8. Compared with the old 16-bit header, W1 saves 3 clocks and W2 saves 1; W4 and W8 use the same number of whole chunks.
 - `SWP2P_MAX_BURST` is limited to 255 by the 8-bit API length. The LEN field width is derived at compile time; increasing the limit also increases required LEN bits and TX buffer RAM. `SWP2PBuffer<CAP>` with `CAP > SWP2P_MAX_BURST` fails at compile time and is not split automatically.
 - This packed-header/LEN format is not wire-compatible with older releases; every node on a bus must use the same format.
@@ -189,7 +193,8 @@ SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 �
 - **마스터 없는 구조**: CLK을 출력하는 노드가 있을 수는 있지만, 그 노드가 버스의 주인(마스터) 역할을 하지 않습니다. 모든 노드가 대등하게 송수신에 참여합니다.
 - **가변 데이터 폭**: 데이터선을 1/2/4/8개 중에서 선택할 수 있습니다 (`DataPreset`). 선 개수가 늘어날수록 사이클당 더 많은 비트를 실어 전송 속도를 높일 수 있습니다.
 - **CLK/BUSY/ACK 3선 기반 프로토콜**: 최소한의 제어선(BUSY, ACK)만으로 다수 노드(설계 목표 약 10개) 연결을 지원합니다.
-- **비트 단위 중재(arbitration)**: `DEST(6) + SRC(6) + BURST(1)` 헤더를 MSB부터 open-drain 방식으로 보내고 매 하강 에지에서 되읽어 비교합니다. 패배한 노드는 이미 보낸 헤더 접두부를 복원해 승자 프레임 수신을 이어가며, BUSY가 idle이 되면 재시도합니다.
+- **고정 ID별 CLK 슬롯 송신권 결정**: 헤더 비트 중재 대신 버스 idle 복귀 후 CLK 상승 에지마다 증가하는 슬롯 카운터를 기반으로 송신 시점을 순서화합니다. 각 노드는 자기 슬롯에서 BUSY 핀이 HIGH인 경우에만 버스를 점유(LOW)하고 송신을 시작하므로 데이터선 충돌이 원천 방지됩니다(필요시 라운드로빈 공정성 활성화 가능).
+- **데이터 프레임 전체 푸시풀(Push-Pull) 구동**: 슬롯을 점유한 단일 송신자만 프레임을 전송하므로, 헤더부터 LEN/DATA까지 프레임 전체를 푸시풀로 구동합니다. 오픈드레인 방식 대비 신호 상승 시간이 대폭 개선되어 더 높은 CLK 주파수에서도 안정적인 통신이 가능합니다.
 - **단일 바이트 / 버스트 전송 모두 지원**: `send()`는 기존 빠른 경로를 그대로 사용하고, `sendBurst()`는 길이(LEN) 필드를 추가로 실어 여러 바이트를 한 번에 전송합니다.
 - **실제 ACK 확인 + 타임아웃**: 데이터를 다 보냈다고 곧바로 성공 처리하지 않고, 목적지 노드가 실제로 ACK 라인을 LOW로 구동하는지 제한된 시간 동안 기다립니다(`isAckFailed()`로 실패 여부 조회 가능).
 - **수신 바이트마다 발신자 ID 동반 제공**: RX FIFO에 데이터 바이트와 발신자 ID가 함께 쌓여, 여러 상대와 통신하는 노드도 출처를 구분할 수 있습니다.
@@ -205,7 +210,7 @@ SPI/I2C/CAN처럼 마스터를 거쳐 슬레이브 ↔ 슬레이브 통신을 �
 | ACK | D8 / PB0 (Timer1 Input Capture, ICP1) | 목적지 노드가 실제로 LOW 구동하여 수신을 확인 |
 | 데이터선 | Preset에 따라 D4~D7 / D9,D10 / A0~A3 등 | `DataPreset`으로 선택 |
 
-데이터선은 항상 open-drain(풀업 필요)으로 구동되며, 각 `DataPreset`에 맞춰 컴파일타임에 `_driveDataChunk` / `_readDataChunk` / `_dataRelease`가 특수화(`if constexpr`)되어 인라인 전개됩니다.
+이 실험 브랜치에서는 슬롯을 획득한 송신 노드가 헤더부터 LEN, DATA까지 프레임 전체를 push-pull로 구동합니다. BUSY와 ACK는 계속 open-drain입니다. 제어선(BUSY, ACK)에는 외부 풀업 저항이 필수이며, 데이터선도 idle 시 플로팅 방지를 위해 풀업 저항 사용을 권장합니다. 슬롯 선점을 통해 충돌 없는 단독 전송이 보장됩니다.
 
 ## 설치
 
@@ -324,16 +329,19 @@ node.buffFree(buf, 2);
 
 | Preset | 데이터선 | 폭 |
 |---|---|---|
-| `PRESET_W1_D4`~`PRESET_W1_D10`, `PRESET_W1_A0` | 1개 | 1비트 |
-| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_D9_D10`, `PRESET_W2_A0_A1` | 2개 | 2비트 |
-| `PRESET_W4_D4_D7`, `PRESET_W4_A0_A3`, `PRESET_W4_D9_D12` | 4개 | 4비트 |
+| `PRESET_W1_D4`~`PRESET_W1_D7`, `D10`, `A0` | 1개 | 1비트 |
+| `PRESET_W1_D9` | 1개 (D9) | 1비트 (슬레이브 전용, CLK 마스터 D9와 충돌) |
+| `PRESET_W2_D4_D5`, `PRESET_W2_D6_D7`, `PRESET_W2_A0_A1` | 2개 | 2비트 |
+| `PRESET_W2_D9_D10` | 2개 (D9,D10) | 2비트 (슬레이브 전용, CLK 마스터 D9와 충돌) |
+| `PRESET_W4_D4_D7` (기본 권장), `PRESET_W4_A0_A3` | 4개 | 4비트 |
+| `PRESET_W4_D9_D12` | 4개 (D9~D12) | 4비트 (슬레이브 전용, CLK 마스터 D9와 충돌) |
 | `PRESET_W8_A0_D7` | 8개 | 8비트 |
 
 폭이 넓을수록 한 번의 클럭 엣지에 더 많은 비트를 실어 보내 전송 사이클 수는 줄지만, 실측상 ISR 처리 시간이 병목이 되어 최대 클럭 주파수는 오히려 낮아지는 경향이 있었습니다(내부 실측 기준: WIDTH=1에서 약 40kHz, WIDTH=8에서 약 29kHz). 용도에 맞게 트레이드오프를 고려해 선택하세요.
 
 ## 프로토콜 개요
 
-1. **ARB (중재)**: `DEST(6) + SRC(6) + BURST(1)`을 MSB부터 open-drain으로 보내고 각 하강 에지에서 되읽어 비교합니다. 필드는 프리셋 폭 청크 경계까지 0으로 패딩됩니다. 패배한 노드는 보낸 헤더 접두부를 복원해 승자 패킷 수신을 이어가고 BUSY idle 후 재시도합니다.
+1. **HEADER (슬롯 기반 송신권 결정 및 헤더 전송)**: BUSY가 유휴(idle)로 돌아오면 슬롯 카운터를 0으로 초기화합니다. 매 CLK 상승 에지마다 각 노드는 자기 슬롯(`_slotCounter == _nodeId`)에서 BUSY 핀을 확인하고, 여전히 HIGH인 경우에만 LOW로 점유한 뒤 `DEST(6) + SRC(6) + BURST(1)` 헤더를 push-pull로 출력합니다. 다른 노드는 BUSY LOW를 감지하고 수신 상태로 진입합니다.
 2. **LEN (버스트일 때만)**: `SWP2P_MAX_BURST`에 필요한 최소 비트로 `len - 2`를 인코딩하고, 프리셋 폭의 청크 경계까지 0으로 패딩합니다(단일 바이트 전송에는 없습니다).
 3. **DATA**: 1바이트(단일 전송) 또는 `len`바이트(버스트)를 순서대로 전송합니다.
 4. **ACK**: 송신 측은 데이터선은 놓아주지만 BUSY는 계속 잡은 채, 목적지 노드가 ACK을 LOW로 구동하는지 제한된 클럭 엣지 수만큼 기다립니다. 제 시간에 ACK이 오면 전송 성공으로 처리되고, 못 받으면 타임아웃되어 다음 조회 시 `isAckFailed()`가 `true`를 반환합니다. 어느 쪽이든 대기가 끝나면 BUSY는 해제되어 다른 노드가 버스를 사용할 수 있습니다.
@@ -342,7 +350,7 @@ node.buffFree(buf, 2);
 
 ## 설계상 제약 / 주의사항
 
-- 데이터선은 반드시 풀업 저항이 있는 open-drain 구성이어야 합니다 (풀업이 없으면 통신 자체가 불가능함을 실측으로 확인).
+- 제어선(BUSY, ACK)은 open-drain으로 동작하므로 반드시 외부 풀업 저항이 필요합니다. 데이터선은 푸시풀로 구동되지만 유휴 상태 플로팅 방지를 위해 풀업 저항 구성을 권장합니다.
 - 노드 ID는 0~62이며, 63(`SWP2P_BROADCAST`)은 브로드캐스트 전용입니다. packed 13비트 헤더는 W1/W2에서 기존 16비트 헤더보다 각각 3/1클럭을 줄이고, W4/W8에서는 청크 올림 때문에 클럭 수가 같습니다.
 - `SWP2P_MAX_BURST`는 8비트 길이 API에 따라 최대 255입니다. LEN 비트 수는 이 설정에서 컴파일타임으로 계산됩니다. 버스트 최댓값을 키우면 LEN 비트와 TX 버퍼 RAM 사용량도 증가합니다. `CAP`이 `SWP2P_MAX_BURST`를 넘으면 컴파일 에러가 나며, 자동 분할하지 않습니다.
 - 새 packed header/LEN 형식은 이전 버전과 선로 호환되지 않으므로 한 버스의 모든 노드를 같은 형식으로 업데이트해야 합니다.

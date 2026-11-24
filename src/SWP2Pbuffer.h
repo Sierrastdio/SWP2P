@@ -14,7 +14,7 @@
  *
  *            <http://www.gnu.org/licenses/>.
  *********************************************************************************************************/
-
+// clang-format off
 #ifndef SWP2P_BUFFER_H
 #define SWP2P_BUFFER_H
 #include <Arduino.h>

@@ -35,9 +35,13 @@ uint16_t SWP2PBase::_txArbReg = 0;
 uint8_t SWP2PBase::_txDataReg = 0;
 uint8_t SWP2PBase::_arbChunkCount = 0;
 uint8_t SWP2PBase::_txDataChunkCount = 0;
-uint8_t SWP2PBase::_arbMyChunk = 0;
-uint8_t SWP2PBase::_arbChunksSent = 0; // [버그1 수정]
-uint8_t SWP2PBase::_ackWaitCount = 0;  // [버그4 수정]
+uint8_t SWP2PBase::_ackWaitCount = 0; // [버그4 수정]
+
+uint8_t SWP2PBase::_slotCounter = 0; // 슬롯 중재 카운터 (idle 시 CLK 상승 에지마다 증가)
+#if SWP2P_ROUND_ROBIN
+uint8_t SWP2PBase::_slotBase = 0;
+uint8_t SWP2PBase::_lastSenderId = 0;
+#endif
 
 // ---- Dynamic Clock Scaling ----
 volatile bool SWP2PBase::_isClkMaster = false;
@@ -51,8 +55,12 @@ uint8_t SWP2PBase::_rxChunkCount = 0;
 uint8_t SWP2PBase::_rxLen = 0;
 uint8_t SWP2PBase::_rxByteIdx = 0;
 
-void SWP2PBase::_fifoPush(uint8_t val, uint8_t srcId) { // [발신자 ID 수정]
-    if (_rxCount >= SWP2P_FIFO_DEPTH) return;
+void SWP2PBase::_fifoPush(uint8_t val, uint8_t srcId)
+{ // [발신자 ID 수정]
+    if (_rxCount >= SWP2P_FIFO_DEPTH)
+    {
+        return;
+    }
     _rxFifo[_rxHead] = val;
     _rxSrcFifo[_rxHead] = srcId; // 데이터와 같은 인덱스에 발신자 ID도 같이 저장 (한 큐에서 동기화 유지)
     // _rxHead = (_rxHead + 1) % SWP2P_FIFO_DEPTH 연산을 비트 마스크로 고속 처리
@@ -62,10 +70,11 @@ void SWP2PBase::_fifoPush(uint8_t val, uint8_t srcId) { // [발신자 ID 수정]
     _rxCount++;
 }
 
-void SWP2PBase::setupTimer1(unsigned long freq) {
+void SWP2PBase::setupTimer1(unsigned long freq)
+{
     TCCR1A = 0; // 0x00 (0000 0000) : Timer1 제어 레지스터 A 초기화
     TCCR1B = 0; // 0x00 (0000 0000) : Timer1 제어 레지스터 B 초기화
-    TCNT1  = 0; // 0x0000 : 타이머 카운터 값 0으로 초기화
+    TCNT1 = 0;  // 0x0000 : 타이머 카운터 값 0으로 초기화
 
     // CTC 모드 토글 주파수 공식: F_oc1a = F_CPU / (2 * N * (1 + OCR1A))  (단, 분주비 N = 1)
     // 설정 주파수(freq)에 맞는 OCR1A 비교 일치 값 계산 (_freqToOcr에서 범위 클램프 처리)
@@ -81,7 +90,8 @@ void SWP2PBase::setupTimer1(unsigned long freq) {
     TCCR1B |= (1 << WGM12) | (1 << CS10); // WGM12, bit 3: 0000 1000; CS10, bit 0: 0000 0001
 }
 
-void SWP2PBase::stopTimer1() {
+void SWP2PBase::stopTimer1()
+{
     // CS12, CS11, CS10 비트를 모두 0으로 만들어 클럭 공급 차단 (타이머 정지)
     TCCR1B = 0; // 0x00 (0000 0000)
 }
